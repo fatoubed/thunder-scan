@@ -16,16 +16,25 @@ import Vision
 enum ColorChoice: String, CaseIterable, Identifiable {
     case color = "彩色", gray = "灰度", bw = "黑白"
     var id: String { rawValue }
+    var label: String { rawValue }
 }
 
 enum SourceChoice: String, CaseIterable, Identifiable {
     case auto = "自动", platen = "玻璃板", feeder = "送纸器"
     var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "自动选择"
+        case .platen: return "平板"
+        case .feeder: return "自动进纸器"
+        }
+    }
 }
 
 enum PaperChoice: String, CaseIterable, Identifiable {
     case a4 = "A4", letter = "Letter", full = "整个玻璃板"
     var id: String { rawValue }
+    var label: String { self == .full ? "最大扫描区域" : rawValue }
     /// 单位：1/300 英寸
     var size: (Int, Int) {
         switch self {
@@ -41,11 +50,19 @@ enum BgChoice: String, CaseIterable, Identifiable {
     case light = "证件/照片：白底变纯白，保留颜色"
     case document = "文档：去阴影，背景纯白"
     var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: return "不处理"
+        case .light: return "证件与照片：背景纯白，保留彩色"
+        case .document: return "文档：去除阴影，背景纯白"
+        }
+    }
 }
 
 enum QualityChoice: String, CaseIterable, Identifiable {
     case high = "高质量", standard = "标准", small = "小文件"
     var id: String { rawValue }
+    var label: String { self == .small ? "高压缩（文件较小）" : rawValue }
     var jpeg: Double {
         switch self {
         case .high: return 0.92
@@ -58,6 +75,7 @@ enum QualityChoice: String, CaseIterable, Identifiable {
 enum FormatChoice: String, CaseIterable, Identifiable {
     case pdf = "PDF", jpg = "JPG"
     var id: String { rawValue }
+    var label: String { rawValue }
 }
 
 struct ProcSettings: Equatable {
@@ -495,15 +513,15 @@ enum Exporter {
         let tmpNew = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
         defer { try? FileManager.default.removeItem(at: tmpNew) }
         try writePDF(items, quality: quality, to: tmpNew)
-        guard let doc = PDFDocument(url: target) else { throw AppError("打不开这个 PDF：\(target.lastPathComponent)") }
-        if doc.isLocked { throw AppError("这个 PDF 有密码保护，不能插入。") }
-        guard let add = PDFDocument(url: tmpNew) else { throw AppError("生成扫描页失败") }
+        guard let doc = PDFDocument(url: target) else { throw AppError("无法打开 PDF 文件：\(target.lastPathComponent)") }
+        if doc.isLocked { throw AppError("该 PDF 文件受密码保护，无法插入页面。") }
+        guard let add = PDFDocument(url: tmpNew) else { throw AppError("生成扫描页面失败。") }
         var at = min(max(0, after), doc.pageCount)
         for i in 0..<add.pageCount {
             if let p = add.page(at: i) { doc.insert(p, at: at); at += 1 }
         }
         let tmpOut = target.deletingLastPathComponent().appendingPathComponent(".扫描临时-\(UUID().uuidString).pdf")
-        guard doc.write(to: tmpOut) else { throw AppError("写入失败（文件夹可能没有写权限）") }
+        guard doc.write(to: tmpOut) else { throw AppError("写入失败，请检查目标文件夹的写入权限。") }
         do {
             try FileManager.default.trashItem(at: target, resultingItemURL: nil)
             try FileManager.default.moveItem(at: tmpOut, to: target)
@@ -536,7 +554,7 @@ struct ESCL {
 
     func get(_ pathOrURL: String, timeout: Double) async throws -> (Data, Int) {
         let s = pathOrURL.hasPrefix("http") ? pathOrURL : base + pathOrURL
-        guard let url = URL(string: s) else { throw AppError("扫描仪地址不对：\(host)") }
+        guard let url = URL(string: s) else { throw AppError("扫描仪地址无效：\(host)") }
         let req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         let (d, r) = try await Self.session.data(for: req)
         return (d, (r as? HTTPURLResponse)?.statusCode ?? 0)
@@ -549,7 +567,7 @@ struct ESCL {
 
     func status() async throws -> ScannerStatus {
         let (d, code) = try await get("/eSCL/ScannerStatus", timeout: 4)
-        guard code == 200, let s = String(data: d, encoding: .utf8) else { throw AppError("扫描仪没有响应（HTTP \(code)）") }
+        guard code == 200, let s = String(data: d, encoding: .utf8) else { throw AppError("扫描仪未响应（HTTP \(code)）。") }
         return ScannerStatus(state: Self.tag(s, "pwg:State") ?? "", adfLoaded: s.contains("ScannerAdfLoaded"))
     }
 
@@ -596,7 +614,7 @@ struct ESCL {
         <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat><scan:DocumentFormatExt>image/jpeg</scan:DocumentFormatExt>
         </scan:ScanSettings>
         """
-        guard let url = URL(string: base + "/eSCL/ScanJobs") else { throw AppError("扫描仪地址不对：\(host)") }
+        guard let url = URL(string: base + "/eSCL/ScanJobs") else { throw AppError("扫描仪地址无效：\(host)") }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         req.httpMethod = "POST"
         req.setValue("text/xml", forHTTPHeaderField: "Content-Type")
@@ -609,9 +627,9 @@ struct ESCL {
             let code = http?.statusCode ?? 0
             if code == 201, let loc = http?.value(forHTTPHeaderField: "Location") { location = loc; break }
             if code == 503 || code == 409 { try await Task.sleep(nanoseconds: 2_000_000_000); continue }
-            throw AppError("扫描仪拒绝了这次扫描（HTTP \(code)）。可能是这个分辨率/来源不支持。")
+            throw AppError("扫描仪拒绝了扫描请求（HTTP \(code)），可能不支持当前的分辨率或来源。")
         }
-        guard let loc = location else { throw AppError("扫描仪一直在忙（可能正在打印），稍后再试。") }
+        guard let loc = location else { throw AppError("扫描仪处于忙碌状态（可能正在打印），请稍后重试。") }
         let job = loc.hasPrefix("http") ? loc : base + loc
 
         var pages = 0, busy = 0
@@ -627,9 +645,9 @@ struct ESCL {
             if code == 404 { break }
             if code == 503 && busy < 90 { busy += 1; try await Task.sleep(nanoseconds: 1_000_000_000); continue }
             if pages > 0 { break }
-            throw AppError("取扫描结果失败（HTTP \(code)）")
+            throw AppError("获取扫描结果失败（HTTP \(code)）。")
         }
-        if pages == 0 { throw AppError("没有拿到扫描结果。送纸器卡纸或没纸？") }
+        if pages == 0 { throw AppError("未获取到扫描结果，请检查自动进纸器是否卡纸或缺纸。") }
         return pages
     }
 
@@ -699,7 +717,12 @@ struct ScanPage: Identifiable {
 final class AppModel: ObservableObject {
     private let ud = UserDefaults.standard
 
-    @Published var host: String { didSet { ud.set(host, forKey: "host"); online = nil; Task { await refreshStatus() } } }
+    @Published var host: String {
+        didSet {
+            guard host != oldValue else { return }
+            ud.set(host, forKey: "host"); online = nil; Task { await refreshStatus() }
+        }
+    }
     @Published var source: SourceChoice { didSet { ud.set(source.rawValue, forKey: "source") } }
     @Published var color: ColorChoice { didSet { ud.set(color.rawValue, forKey: "color"); reprocessAll() } }
     @Published var dpi: Int { didSet { ud.set(dpi, forKey: "dpi") } }
@@ -757,7 +780,18 @@ final class AppModel: ObservableObject {
         revealAfterSave = bool("reveal", true)
         clearAfterSave = bool("clear", true)
         AppModel.shared = self
+        // 演示模式（README 截图用）：显示示例地址与在线状态，不连接真实设备，不改动已保存的设置
+        if ProcessInfo.processInfo.environment["SCAN_DEMO"] != nil {
+            demo = true
+            host = "192.168.1.20"
+            online = true
+            scannerState = "Idle"
+            found = [FoundScanner(id: "192.168.1.20", model: "HP Color LaserJet MFP M277dw")]
+            statusText = "本次扫描 1 页，共 4 页"
+        }
     }
+
+    private var demo = false
 
     var settings: ProcSettings { ProcSettings(bg: bg, color: color, autoCrop: autoCrop, despeckle: despeckle) }
     var busy: Bool { isScanning || isSaving }
@@ -766,7 +800,7 @@ final class AppModel: ObservableObject {
 
     // 状态轮询
     func startPolling() {
-        guard !polling else { return }
+        guard !polling, !demo else { return }
         polling = true
         if host.trimmingCharacters(in: .whitespaces).isEmpty { discover(silent: true) }
         Task {
@@ -778,7 +812,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshStatus() async {
-        if isScanning { return }
+        if isScanning || demo { return }
         if host.trimmingCharacters(in: .whitespaces).isEmpty { online = false; scannerState = ""; return }
         do {
             let st = try await esc.status()
@@ -791,19 +825,19 @@ final class AppModel: ObservableObject {
     func discover(silent: Bool = false) {
         searching = true
         found = []
-        if silent { statusText = "正在局域网里查找扫描仪…" }
+        if silent { statusText = "正在局域网中查找扫描仪…" }
         Task {
             let r = await ESCL.discover()
             found = r
             searching = false
             if r.isEmpty {
-                let msg = "在本机所在网段里没找到扫描仪。请确认打印机已开机、和电脑连的是同一个 Wi-Fi，或者在左边手动填打印机的 IP 地址。"
-                if silent { statusText = "没找到扫描仪，可以手动填地址" } else { alert = msg }
+                let msg = "在本机所在网段中未找到扫描仪。请确认打印机已开机并与本机连接同一网络，或在左侧手动输入打印机的 IP 地址。"
+                if silent { statusText = "未找到扫描仪，请手动输入地址" } else { alert = msg }
             } else if r.count == 1 || host.trimmingCharacters(in: .whitespaces).isEmpty {
                 host = r[0].id
-                statusText = r.count == 1 ? "已找到并使用 \(r[0].model)（\(r[0].id)）" : "找到 \(r.count) 台扫描仪，先用了第一台，可以在左边换"
+                statusText = r.count == 1 ? "已连接 \(r[0].model)（\(r[0].id)）" : "找到 \(r.count) 台扫描仪，已选用第一台，可在左侧更改"
             } else {
-                statusText = "找到 \(r.count) 台扫描仪，在左边点一下选用"
+                statusText = "找到 \(r.count) 台扫描仪，请在左侧选择"
             }
         }
     }
@@ -816,7 +850,7 @@ final class AppModel: ObservableObject {
         Task {
             do {
                 if host.trimmingCharacters(in: .whitespaces).isEmpty {
-                    throw AppError("还没设置扫描仪。点左边「自动查找扫描仪」，或者手动填打印机的 IP 地址。")
+                    throw AppError("尚未设置扫描仪。请点击左侧「自动查找扫描仪」，或手动输入打印机的 IP 地址。")
                 }
                 let e = esc
                 let st = try await e.status()
@@ -828,22 +862,22 @@ final class AppModel: ObservableObject {
                 case .feeder: feeder = true
                 }
                 if feeder && !st.adfLoaded {
-                    throw AppError("送纸器里没有纸。请把纸放进上面的送纸器，或把「来源」改成「玻璃板」。")
+                    throw AppError("自动进纸器中没有纸张。请放入纸张，或将「来源」改为「平板」。")
                 }
                 let (d, pw, ph) = await e.adjust(feeder: feeder, dpi: dpi, width: paper.size.0, height: paper.size.1)
                 let before = pages.count
-                statusText = feeder ? "正在从送纸器扫描…" : "正在扫描玻璃板…（第 \(before + 1) 页）"
+                statusText = feeder ? "正在从自动进纸器扫描…" : "正在扫描第 \(before + 1) 页…"
                 let n = try await e.scan(feeder: feeder, gray: color != .color, dpi: d, width: pw, height: ph) { data in
                     await MainActor.run {
                         self.addPage(data, dpi: d)
-                        if feeder { self.statusText = "正在从送纸器扫描…已收到 \(self.pages.count - before) 页" }
+                        if feeder { self.statusText = "正在从自动进纸器扫描…已接收 \(self.pages.count - before) 页" }
                     }
                 }
-                var msg = "扫好了 \(n) 页，现在一共 \(pages.count) 页"
-                if d != dpi { msg += "（这台扫描仪的\(feeder ? "送纸器" : "玻璃板")不支持 \(dpi) dpi，这次用的是 \(d) dpi）" }
+                var msg = "本次扫描 \(n) 页，共 \(pages.count) 页"
+                if d != dpi { msg += "（该扫描仪的\(feeder ? "自动进纸器" : "平板")不支持 \(dpi) dpi，已改用 \(d) dpi）" }
                 statusText = msg
             } catch {
-                statusText = "扫描没成功"
+                statusText = "扫描失败"
                 alert = Self.friendly(error)
             }
             isScanning = false
@@ -854,13 +888,13 @@ final class AppModel: ObservableObject {
         if let e = error as? AppError { return e.message }
         let ns = error as NSError
         if ns.domain == NSURLErrorDomain {
-            return "连不上扫描仪。请确认打印机开着、和电脑在同一个 Wi-Fi，或者点左边「自动查找扫描仪」。\n（\(ns.localizedDescription)）"
+            return "无法连接扫描仪。请确认打印机已开机并与本机连接同一网络，或点击左侧「自动查找扫描仪」。\n（详细信息：\(ns.localizedDescription)）"
         }
         return error.localizedDescription
     }
 
     func addPage(_ data: Data, dpi: Int) {
-        guard let img = ImageOps.decode(data) else { alert = "扫描结果无法解码"; return }
+        guard let img = ImageOps.decode(data) else { alert = "无法解码扫描结果。"; return }
         let p = ScanPage(raw: img, dpi: dpi)
         pages.append(p)
         enqueue(p.id)
@@ -927,7 +961,7 @@ final class AppModel: ObservableObject {
     func clearAll() {
         pages.removeAll()
         queue.removeAll()
-        statusText = "已清空"
+        statusText = "已清空全部页面"
     }
 
     // 输出
@@ -938,8 +972,8 @@ final class AppModel: ObservableObject {
         p.canCreateDirectories = true
         p.allowsMultipleSelection = false
         p.directoryURL = outputURL
-        p.prompt = "选这个文件夹"
-        p.message = "扫描文件保存到哪里？"
+        p.prompt = "选择"
+        p.message = "选择扫描文件的保存位置"
         if p.runModal() == .OK, let u = p.url { outputDir = u.path }
     }
 
@@ -989,10 +1023,10 @@ final class AppModel: ObservableObject {
         p.allowedContentTypes = [.pdf]
         p.allowsMultipleSelection = false
         p.directoryURL = outputURL
-        p.prompt = "选这个 PDF"
-        p.message = "选择要把扫描页插进去的 PDF"
+        p.prompt = "选择"
+        p.message = "选择要插入扫描页面的 PDF 文件"
         guard p.runModal() == .OK, let u = p.url else { return }
-        guard let doc = PDFDocument(url: u) else { alert = "打不开这个 PDF"; return }
+        guard let doc = PDFDocument(url: u) else { alert = "无法打开所选 PDF 文件。"; return }
         appendPageCount = doc.pageCount
         appendAfter = doc.pageCount
         appendTarget = u
@@ -1002,7 +1036,7 @@ final class AppModel: ObservableObject {
         guard let target = appendTarget, !busy else { return }
         appendTarget = nil
         isSaving = true
-        statusText = "正在插入到 \(target.lastPathComponent)…"
+        statusText = "正在将页面插入 \(target.lastPathComponent)…"
         Task {
             await waitProcessing()
             let its = items(), q = quality.jpeg, after = appendAfter
@@ -1010,7 +1044,7 @@ final class AppModel: ObservableObject {
                 try await Task.detached(priority: .userInitiated) {
                     try Exporter.insert(its, quality: q, into: target, after: after)
                 }.value
-                statusText = "已把 \(its.count) 页插入 \(target.lastPathComponent)（旧版已移到废纸篓）"
+                statusText = "已将 \(its.count) 页插入 \(target.lastPathComponent)，原文件已移至废纸篓"
                 if revealAfterSave { NSWorkspace.shared.activateFileViewerSelecting([target]) }
                 if clearAfterSave { pages.removeAll() }
             } catch {
@@ -1037,7 +1071,7 @@ struct ContentView: View {
             Divider()
             VStack(spacing: 0) {
                 HStack {
-                    Text(m.pages.isEmpty ? "还没有扫描页面" : "已扫描 \(m.pages.count) 页")
+                    Text(m.pages.isEmpty ? "暂无扫描页面" : "已扫描 \(m.pages.count) 页")
                         .font(.headline)
                     if m.pages.contains(where: { $0.processing }) {
                         ProgressView().controlSize(.small)
@@ -1045,7 +1079,7 @@ struct ContentView: View {
                     }
                     Spacer()
                     if !m.pages.isEmpty {
-                        Text("点页面可放大查看").foregroundStyle(.secondary).font(.callout)
+                        Text("点击页面可放大预览").foregroundStyle(.secondary).font(.callout)
                         Button(role: .destructive) { confirmClear = true } label: { Label("清空全部", systemImage: "trash") }
                             .disabled(m.busy)
                     }
@@ -1058,9 +1092,9 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1080, minHeight: 680)
-        .confirmationDialog("清空所有已扫描的页面？", isPresented: $confirmClear) {
+        .confirmationDialog("确定清空全部已扫描页面？", isPresented: $confirmClear) {
             Button("清空 \(m.pages.count) 页", role: .destructive) { m.clearAll() }
-        } message: { Text("没保存的页面会丢失。") }
+        } message: { Text("未保存的页面将无法恢复。") }
         .sheet(item: Binding(get: { m.previewID.map { PreviewItem(id: $0) } }, set: { m.previewID = $0?.id })) { item in
             PreviewSheet(currentID: item.id).environmentObject(m)
         }
@@ -1068,7 +1102,7 @@ struct ContentView: View {
             InsertSheet().environmentObject(m)
         }
         .alert("提示", isPresented: Binding(get: { m.alert != nil }, set: { if !$0 { m.alert = nil } })) {
-            Button("好") { m.alert = nil }
+            Button("确定") { m.alert = nil }
         } message: { Text(m.alert ?? "") }
     }
 }
@@ -1078,13 +1112,13 @@ struct SettingsPanel: View {
 
     var statusLabel: (String, Color) {
         if m.host.trimmingCharacters(in: .whitespaces).isEmpty { return (m.searching ? "正在查找…" : "未设置", .gray) }
-        guard let on = m.online else { return ("检查中…", .gray) }
-        if !on { return ("连不上", .red) }
+        guard let on = m.online else { return ("正在检测…", .gray) }
+        if !on { return ("无法连接", .red) }
         switch m.scannerState {
         case "Idle": return ("在线 · 空闲", .green)
-        case "Processing": return ("在线 · 忙（正在扫描或打印）", .orange)
+        case "Processing": return ("在线 · 忙碌（正在扫描或打印）", .orange)
         case "Testing": return ("在线 · 自检中", .orange)
-        case "Stopped": return ("在线 · 已停止（检查面板）", .red)
+        case "Stopped": return ("在线 · 已停止（请检查打印机面板）", .red)
         default: return ("在线", .green)
         }
     }
@@ -1092,14 +1126,14 @@ struct SettingsPanel: View {
     var body: some View {
         Form {
             Section("扫描仪") {
-                TextField("地址", text: $m.host, prompt: Text("打印机 IP，如 192.168.1.20"))
+                TextField("地址", text: $m.host, prompt: Text("打印机 IP 地址，例如 192.168.1.20"))
                 LabeledContent("状态") {
                     HStack(spacing: 6) {
                         Circle().fill(statusLabel.1).frame(width: 9, height: 9)
                         Text(statusLabel.0)
                     }
                 }
-                LabeledContent("送纸器") { Text(m.adfLoaded ? "有纸" : "没纸") }
+                LabeledContent("自动进纸器") { Text(m.adfLoaded ? "已放入纸张" : "无纸张") }
                 HStack {
                     Button(m.searching ? "正在查找…" : "自动查找扫描仪") { m.discover() }
                         .disabled(m.searching)
@@ -1121,45 +1155,45 @@ struct SettingsPanel: View {
 
             Section {
                 Picker("来源", selection: $m.source) {
-                    ForEach(SourceChoice.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(SourceChoice.allCases) { Text($0.label).tag($0) }
                 }
                 Picker("颜色", selection: $m.color) {
-                    ForEach(ColorChoice.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(ColorChoice.allCases) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 Picker("分辨率", selection: $m.dpi) {
                     Text("75 dpi · 预览").tag(75)
-                    Text("200 dpi · 文件小").tag(200)
+                    Text("200 dpi · 较小文件").tag(200)
                     Text("300 dpi · 推荐").tag(300)
-                    Text("600 dpi · 精细（仅玻璃板）").tag(600)
+                    Text("600 dpi · 高精度（仅平板）").tag(600)
                 }
                 Picker("纸张", selection: $m.paper) {
-                    ForEach(PaperChoice.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(PaperChoice.allCases) { Text($0.label).tag($0) }
                 }
             } header: {
                 Text("扫描")
             } footer: {
-                Text("来源选「自动」：送纸器里有纸就从送纸器扫（一次扫完多页），没纸就扫玻璃板。送纸器最高 300 dpi。")
+                Text("来源为「自动选择」时：自动进纸器中有纸张则从进纸器扫描（可连续扫描多页），否则从平板扫描。自动进纸器最高支持 300 dpi。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
                 Picker("背景", selection: $m.bg) {
-                    ForEach(BgChoice.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(BgChoice.allCases) { Text($0.label).tag($0) }
                 }
-                Toggle("自动裁掉四周空白（护照、证件、小票）", isOn: $m.autoCrop)
-                Toggle("去掉小污点、灰尘", isOn: $m.despeckle)
+                Toggle("自动裁除四周空白（适用于护照、证件、票据）", isOn: $m.autoCrop)
+                Toggle("去除污点和灰尘", isOn: $m.despeckle)
                     .disabled(m.bg != .document && m.color != .bw)
-                Toggle("自动转正（按文字方向判断）", isOn: $m.autoRotate)
+                Toggle("自动校正方向（依据文字方向）", isOn: $m.autoRotate)
             } header: {
                 Text("图像处理")
             } footer: {
-                Text("文字表格用「文档」；护照、证件、照片用「证件/照片」，不会把彩色底纹洗白。改了设置会自动重新处理已扫的页面。")
+                Text("文字与表格请选择「文档」；护照、证件和照片请选择「证件与照片」，以保留彩色底纹。修改设置后，已扫描的页面将自动重新处理。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("输出") {
-                LabeledContent("保存到") {
+                LabeledContent("保存位置") {
                     Text((m.outputDir as NSString).abbreviatingWithTildeInPath)
                         .lineLimit(1).truncationMode(.middle)
                 }
@@ -1168,10 +1202,10 @@ struct SettingsPanel: View {
                     Button("在访达中打开") { NSWorkspace.shared.open(m.outputURL) }
                 }
                 Picker("文件质量", selection: $m.quality) {
-                    ForEach(QualityChoice.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(QualityChoice.allCases) { Text($0.label).tag($0) }
                 }
                 Toggle("保存后在访达中显示", isOn: $m.revealAfterSave)
-                Toggle("保存后清空已扫页面", isOn: $m.clearAfterSave)
+                Toggle("保存后清空已扫描页面", isOn: $m.clearAfterSave)
             }
         }
         .formStyle(.grouped)
@@ -1187,9 +1221,9 @@ struct PagesArea: View {
                 Image(systemName: "doc.viewfinder")
                     .font(.system(size: 64, weight: .light))
                     .foregroundStyle(.secondary)
-                Text("把文件放到玻璃板上（或放进送纸器），点「扫描」")
+                Text("将文件放在平板上或放入自动进纸器，然后点击「扫描」")
                     .font(.title3)
-                Text("可以一页一页连续扫，最后一起保存成一个 PDF。\n快捷键：⌘↩ 扫描　⌘S 保存")
+                Text("支持连续扫描多页，并合并保存为一个 PDF 文件。\n快捷键：⌘↩ 扫描　⌘S 保存")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
             }
@@ -1227,7 +1261,7 @@ struct PageCard: View {
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
-                RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .underPageBackgroundColor))
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.10))
                 if let t = page.thumb {
                     Image(nsImage: t)
                         .resizable()
@@ -1247,11 +1281,11 @@ struct PageCard: View {
             .onTapGesture { m.previewID = page.id }
             Text("第 \(index + 1) 页").font(.callout)
             HStack(spacing: 4) {
-                IconButton(symbol: "arrow.left", tip: "往前移") { m.move(page.id, -1) }.disabled(index == 0)
-                IconButton(symbol: "rotate.left", tip: "向左转 90°") { m.rotate(page.id, -90) }
-                IconButton(symbol: "rotate.right", tip: "向右转 90°") { m.rotate(page.id, 90) }
-                IconButton(symbol: "trash", tip: "删除这一页") { m.delete(page.id) }
-                IconButton(symbol: "arrow.right", tip: "往后移") { m.move(page.id, 1) }.disabled(index == count - 1)
+                IconButton(symbol: "arrow.left", tip: "前移") { m.move(page.id, -1) }.disabled(index == 0)
+                IconButton(symbol: "rotate.left", tip: "向左旋转 90°") { m.rotate(page.id, -90) }
+                IconButton(symbol: "rotate.right", tip: "向右旋转 90°") { m.rotate(page.id, 90) }
+                IconButton(symbol: "trash", tip: "删除此页") { m.delete(page.id) }
+                IconButton(symbol: "arrow.right", tip: "后移") { m.move(page.id, 1) }.disabled(index == count - 1)
             }
         }
         .padding(8)
@@ -1278,19 +1312,20 @@ struct BottomBar: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            TextField("文件名（留空按时间命名）", text: $m.fileName)
+            TextField("文件名（留空则按时间命名）", text: $m.fileName)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 200)
             Picker("", selection: $m.format) {
-                ForEach(FormatChoice.allCases) { Text($0.rawValue).tag($0) }
+                ForEach(FormatChoice.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 100)
-            .help("PDF：所有页合成一个文件；JPG：每页一张图片")
-            Button("插入到已有 PDF…") { m.chooseInsertTarget() }
+            .help("PDF：所有页面合并为一个文件；JPG：每页保存为一张图片")
+            Button("插入到现有 PDF…") { m.chooseInsertTarget() }
+                .fixedSize()
                 .disabled(m.pages.isEmpty || m.busy)
-                .help("把扫好的页插进一个现成的 PDF（比如护照合集）")
+                .help("将已扫描的页面插入现有 PDF 文件的指定位置")
             Button { m.save() } label: {
                 Label("保存", systemImage: "square.and.arrow.down").frame(minWidth: 60)
             }
@@ -1321,9 +1356,9 @@ struct PreviewSheet: View {
                 IconButton(symbol: "chevron.left", tip: "上一页") { step(-1) }.disabled((index ?? 0) == 0)
                 IconButton(symbol: "chevron.right", tip: "下一页") { step(1) }.disabled((index ?? 0) >= m.pages.count - 1)
                 Divider().frame(height: 18)
-                IconButton(symbol: "rotate.left", tip: "向左转") { m.rotate(currentID, -90) }
-                IconButton(symbol: "rotate.right", tip: "向右转") { m.rotate(currentID, 90) }
-                IconButton(symbol: "trash", tip: "删除这一页") { deleteCurrent() }
+                IconButton(symbol: "rotate.left", tip: "向左旋转 90°") { m.rotate(currentID, -90) }
+                IconButton(symbol: "rotate.right", tip: "向右旋转 90°") { m.rotate(currentID, 90) }
+                IconButton(symbol: "trash", tip: "删除此页") { deleteCurrent() }
                 Divider().frame(height: 18)
                 Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
             }
@@ -1378,21 +1413,21 @@ struct InsertSheet: View {
 
     var placeText: String {
         let c = m.appendPageCount
-        if m.appendAfter == 0 { return "插到最前面" }
-        if m.appendAfter >= c { return "插到最后（第 \(c) 页之后）" }
-        return "插到第 \(m.appendAfter) 页之后"
+        if m.appendAfter == 0 { return "插入到第 1 页之前" }
+        if m.appendAfter >= c { return "插入到末尾（第 \(c) 页之后）" }
+        return "插入到第 \(m.appendAfter) 页之后"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("插入到已有 PDF").font(.title3.bold())
+            Text("插入到现有 PDF").font(.title3.bold())
             if let t = m.appendTarget {
                 Label("\(t.lastPathComponent)（共 \(m.appendPageCount) 页）", systemImage: "doc.richtext")
             }
             Stepper(value: $m.appendAfter, in: 0...max(0, m.appendPageCount)) {
                 Text(placeText).frame(minWidth: 220, alignment: .leading)
             }
-            Text("会插入 \(m.pages.count) 页（按当前的旋转、背景、裁切设置）。原文件会先移到废纸篓做备份，再写入新版本，文件名不变。")
+            Text("将插入 \(m.pages.count) 页（按当前的旋转、背景和裁切设置）。原文件会先移至废纸篓备份，再写入新版本，文件名保持不变。")
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -1422,9 +1457,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         if let out = env["SCAN_SNAPSHOT"] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(env["SCAN_SNAPSHOT_DELAY"] ?? "6") ?? 6)) {
-                guard let v = NSApp.windows.first(where: { $0.isVisible })?.contentView,
-                      let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(3) }
+            let delay = Double(env["SCAN_SNAPSHOT_DELAY"] ?? "6") ?? 6
+            var oldFrame: NSRect?
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(1, delay - 2)) {
+                NSApp.activate(ignoringOtherApps: true)
+                guard let w = NSApp.windows.first(where: { $0.isVisible }) else { return }
+                w.makeKeyAndOrderFront(nil)
+                // SCAN_SNAPSHOT_SIZE=宽x高：截图时临时调整窗口大小，截完恢复
+                if let sz = env["SCAN_SNAPSHOT_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), sz.count == 2 {
+                    oldFrame = w.frame
+                    w.setContentSize(NSSize(width: sz[0], height: sz[1]))
+                    w.center()
+                }
+                w.makeFirstResponder(nil)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard let w = NSApp.windows.first(where: { $0.isVisible }), let content = w.contentView else { exit(3) }
+                defer { if let f = oldFrame { w.setFrame(f, display: false) } }
+                // 优先用窗口服务器截取本窗口（应用截取自己的窗口无需屏幕录制权限）
+                if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber),
+                                                    [.boundsIgnoreFraming, .bestResolution]), cg.width > 10 {
+                    try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+                    if let f = oldFrame { w.setFrame(f, display: false) }
+                    exit(0)
+                }
+                // 退回：含标题栏的整个窗口（frame view）
+                let v = content.superview ?? content
+                guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(3) }
                 v.cacheDisplay(in: v.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
                 exit(0)
@@ -1500,7 +1559,7 @@ enum CLI {
             } else {
                 img = (try? Data(contentsOf: inURL)).flatMap(ImageOps.decode)
             }
-            guard let src = img else { print("读不了输入文件"); return 1 }
+            guard let src = img else { print("无法读取输入文件"); return 1 }
             let t = Date()
             let out = ImageOps.process(src, dpi: dpi, s: settings(o))
             let rot = o["rot"] == "auto" ? ImageOps.detectRotation(out) : (Int(o["rot"] ?? "0") ?? 0)
@@ -1515,7 +1574,7 @@ enum CLI {
             return runSync {
                 var host = o["host"] ?? ""
                 if host.isEmpty {
-                    guard let f = await ESCL.discover().first else { throw AppError("没找到扫描仪，请用 host=IP 指定") }
+                    guard let f = await ESCL.discover().first else { throw AppError("未找到扫描仪，请使用 host=IP 指定") }
                     host = f.id
                     print("使用扫描仪 \(f.model)（\(f.id)）")
                 }
@@ -1524,7 +1583,7 @@ enum CLI {
                 let feeder = o["src"] == "feeder" || (o["src"] ?? "auto" == "auto" && st.adfLoaded)
                 let paper: PaperChoice = o["paper"] == "letter" ? .letter : (o["paper"] == "full" ? .full : .a4)
                 let (dpi, pw, ph) = await e.adjust(feeder: feeder, dpi: Int(o["dpi"] ?? "300") ?? 300, width: paper.size.0, height: paper.size.1)
-                print("来源 \(feeder ? "送纸器" : "玻璃板")  \(dpi) dpi  区域 \(pw)x\(ph)")
+                print("来源 \(feeder ? "自动进纸器" : "平板")  \(dpi) dpi  区域 \(pw)x\(ph)")
                 let s = settings(o)
                 var items: [Exporter.Item] = []
                 let raws = o["raw"]
@@ -1559,7 +1618,7 @@ enum CLI {
             } catch { print(error.localizedDescription); return 1 }
             return 0
         default:
-            print("未知参数")
+            print("未知参数。可用命令：--discover、--scan、--process、--insert、--export-jpg")
             return 2
         }
     }
