@@ -736,7 +736,10 @@ final class AppModel: ObservableObject {
     @Published var outputDir: String { didSet { ud.set(outputDir, forKey: "outputDir") } }
     @Published var revealAfterSave: Bool { didSet { ud.set(revealAfterSave, forKey: "reveal") } }
     @Published var clearAfterSave: Bool { didSet { ud.set(clearAfterSave, forKey: "clear") } }
+    @Published var confirmActions: Bool { didSet { ud.set(confirmActions, forKey: "confirm") } }
     @Published var fileName = ""
+    @Published var pendingDeleteID: UUID?
+    @Published var pendingSaveName: String?
 
     @Published var pages: [ScanPage] = []
     @Published var isScanning = false
@@ -779,6 +782,7 @@ final class AppModel: ObservableObject {
         outputDir = ud.string(forKey: "outputDir") ?? (NSHomeDirectory() + "/Desktop")
         revealAfterSave = bool("reveal", true)
         clearAfterSave = bool("clear", true)
+        confirmActions = bool("confirm", true)
         AppModel.shared = self
         // 演示模式（README 截图用）：显示示例地址与在线状态，不连接真实设备，不改动已保存的设置
         if ProcessInfo.processInfo.environment["SCAN_DEMO"] != nil {
@@ -994,13 +998,46 @@ final class AppModel: ObservableObject {
         pages.compactMap { p in p.processed.map { Exporter.Item(image: $0, dpi: p.dpi, rotation: p.rotation) } }
     }
 
-    func save() {
+    // 删除、保存前的二次确认
+    func requestDelete(_ id: UUID) {
+        if confirmActions { pendingDeleteID = id } else { delete(id) }
+    }
+
+    func pageNumber(_ id: UUID?) -> Int {
+        guard let id = id, let i = pages.firstIndex(where: { $0.id == id }) else { return 0 }
+        return i + 1
+    }
+
+    func requestSave() {
+        guard !pages.isEmpty, !busy else { return }
+        let name = cleanName()
+        if confirmActions { pendingSaveName = name } else { save(name: name) }
+    }
+
+    func saveSummary(_ name: String) -> String {
+        let n = pages.count
+        let dir = (outputDir as NSString).abbreviatingWithTildeInPath
+        var s: String
+        if format == .pdf {
+            s = "将 \(n) 页合并保存为一个 PDF 文件。\n文件名：\(name).pdf"
+        } else if n == 1 {
+            s = "将 1 页保存为 JPG 图片。\n文件名：\(name).jpg"
+        } else {
+            s = "将 \(n) 页分别保存为 JPG 图片。\n文件名：\(name)_1.jpg 至 \(name)_\(n).jpg"
+        }
+        s += "\n保存位置：\(dir)\n如有同名文件，将自动添加编号，不会覆盖原文件。"
+        if clearAfterSave { s += "\n保存后将清空已扫描页面。" }
+        return s
+    }
+
+    func save(name: String? = nil) {
         guard !pages.isEmpty, !busy else { return }
         isSaving = true
         statusText = "正在保存…"
+        let chosen = name ?? cleanName()
         Task {
             await waitProcessing()
-            let its = items(), q = quality.jpeg, fmt = format, dir = outputURL, name = cleanName()
+            let its = items(), q = quality.jpeg, fmt = format, dir = outputURL, name = chosen
             do {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 let urls = try await Task.detached(priority: .userInitiated) {
@@ -1056,6 +1093,103 @@ final class AppModel: ObservableObject {
     }
 }
 
+// MARK: - 外观（配色、毛玻璃、窗口）
+
+enum Theme {
+    /// macOS 26 及以上使用毛玻璃背景。
+    /// 用旧版 SDK 编译的程序在 macOS 26 上可能读到兼容版本号 16，同样视为 26。
+    /// 调试：SCAN_STYLE=glass / plain 可强制指定。
+    static let glass: Bool = {
+        let env = ProcessInfo.processInfo.environment["SCAN_STYLE"]
+        if env == "glass" { return true }
+        if env == "plain" { return false }
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.majorVersion >= 26 || v.majorVersion == 16
+    }()
+
+    static func dyn(_ light: NSColor, _ dark: NSColor) -> NSColor {
+        NSColor(name: nil) { ap in ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light }
+    }
+
+    static func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+        NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+    }
+
+    // 中性配色（不受桌面壁纸染色影响），浅色与暗色各一套
+    static let sidebarNS = dyn(rgb(242, 242, 245), rgb(36, 36, 39))
+    static let contentNS = dyn(rgb(251, 251, 253), rgb(28, 28, 30))
+    static var sidebar: Color { Color(nsColor: sidebarNS) }
+    static var content: Color { Color(nsColor: contentNS) }
+    static var card: Color {
+        Color(nsColor: glass
+              ? dyn(NSColor(white: 1, alpha: 0.62), NSColor(white: 1, alpha: 0.07))
+              : dyn(.white, rgb(46, 46, 50)))
+    }
+    static var cardStroke: Color {
+        Color(nsColor: dyn(NSColor(white: 0, alpha: 0.08), NSColor(white: 1, alpha: 0.10)))
+    }
+    static var thumbBackdrop: Color {
+        Color(nsColor: glass
+              ? dyn(NSColor(white: 0, alpha: 0.05), NSColor(white: 1, alpha: 0.05))
+              : dyn(rgb(236, 236, 240), rgb(58, 58, 62)))
+    }
+}
+
+/// 毛玻璃背景（NSVisualEffectView，透出窗口后方的内容并模糊）
+struct GlassBackground: NSViewRepresentable {
+    var material: NSVisualEffectView.Material
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = material
+        v.blendingMode = .behindWindow
+        v.state = .followsWindowActiveState
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) { v.material = material }
+}
+
+/// 区域背景：macOS 26+ 为毛玻璃，其余版本为中性纯色
+struct AreaBackground: View {
+    let sidebar: Bool
+    var body: some View {
+        Group {
+            if Theme.glass {
+                GlassBackground(material: sidebar ? .sidebar : .underWindowBackground)
+            } else {
+                sidebar ? Theme.sidebar : Theme.content
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// 窗口配置：标题栏透明、内容延伸至标题栏下方；
+/// 非毛玻璃模式下窗口底色设为中性色，避免标题栏随壁纸染色
+struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { Self.configure(v.window) }
+        return v
+    }
+
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async { Self.configure(v.window) }
+    }
+
+    static func configure(_ w: NSWindow?) {
+        guard let w = w else { return }
+        w.titlebarAppearsTransparent = true
+        if !w.styleMask.contains(.fullSizeContentView) { w.styleMask.insert(.fullSizeContentView) }
+        if Theme.glass {
+            w.isOpaque = false
+            w.backgroundColor = .clear
+        } else {
+            w.isOpaque = true
+            w.backgroundColor = Theme.contentNS
+        }
+    }
+}
+
 // MARK: - 界面
 
 struct ContentView: View {
@@ -1068,7 +1202,8 @@ struct ContentView: View {
         HStack(spacing: 0) {
             SettingsPanel()
                 .frame(width: 340)
-            Divider()
+                .background(AreaBackground(sidebar: true))
+            Divider().ignoresSafeArea()
             VStack(spacing: 0) {
                 HStack {
                     Text(m.pages.isEmpty ? "暂无扫描页面" : "已扫描 \(m.pages.count) 页")
@@ -1090,11 +1225,31 @@ struct ContentView: View {
                 Divider()
                 BottomBar()
             }
+            .background(AreaBackground(sidebar: false))
         }
         .frame(minWidth: 1080, minHeight: 680)
+        .background(WindowConfigurator())
         .confirmationDialog("确定清空全部已扫描页面？", isPresented: $confirmClear) {
             Button("清空 \(m.pages.count) 页", role: .destructive) { m.clearAll() }
+            Button("取消", role: .cancel) {}
         } message: { Text("未保存的页面将无法恢复。") }
+        .confirmationDialog("确定删除第 \(m.pageNumber(m.pendingDeleteID)) 页？",
+                            isPresented: Binding(get: { m.pendingDeleteID != nil }, set: { if !$0 { m.pendingDeleteID = nil } })) {
+            Button("删除", role: .destructive) {
+                if let id = m.pendingDeleteID { m.delete(id) }
+                m.pendingDeleteID = nil
+            }
+            Button("取消", role: .cancel) { m.pendingDeleteID = nil }
+        } message: { Text("删除后无法恢复。") }
+        .alert("确认保存", isPresented: Binding(get: { m.pendingSaveName != nil }, set: { if !$0 { m.pendingSaveName = nil } })) {
+            Button("取消", role: .cancel) { m.pendingSaveName = nil }
+            Button("保存") {
+                let name = m.pendingSaveName
+                m.pendingSaveName = nil
+                m.save(name: name)
+            }
+            .keyboardShortcut(.defaultAction)
+        } message: { Text(m.pendingSaveName.map { m.saveSummary($0) } ?? "") }
         .sheet(item: Binding(get: { m.previewID.map { PreviewItem(id: $0) } }, set: { m.previewID = $0?.id })) { item in
             PreviewSheet(currentID: item.id).environmentObject(m)
         }
@@ -1104,6 +1259,61 @@ struct ContentView: View {
         .alert("提示", isPresented: Binding(get: { m.alert != nil }, set: { if !$0 { m.alert = nil } })) {
             Button("确定") { m.alert = nil }
         } message: { Text(m.alert ?? "") }
+    }
+}
+
+/// 设置分组卡片
+struct SettingsCard<Content: View>: View {
+    let title: String
+    var footer: String? = nil
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 6)
+            VStack(spacing: 0) { content() }
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.card))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.cardStroke, lineWidth: 1))
+            if let f = footer {
+                Text(f)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// 设置行：左侧标签，右侧控件
+struct SettingRow<Trailing: View>: View {
+    let label: String
+    var last = false
+    @ViewBuilder let trailing: () -> Trailing
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                // 短标签不换行；长标签允许换行
+                Text(label).fixedSize(horizontal: label.count <= 6, vertical: true)
+                Spacer(minLength: 8)
+                trailing()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(minHeight: 34)
+            if !last { Divider().padding(.leading, 12) }
+        }
+    }
+}
+
+struct SettingSwitch: View {
+    @Binding var isOn: Bool
+    var body: some View {
+        Toggle("", isOn: $isOn).labelsHidden().toggleStyle(.switch).controlSize(.small)
     }
 }
 
@@ -1124,91 +1334,123 @@ struct SettingsPanel: View {
     }
 
     var body: some View {
-        Form {
-            Section("扫描仪") {
-                TextField("地址", text: $m.host, prompt: Text("打印机 IP 地址，例如 192.168.1.20"))
-                LabeledContent("状态") {
-                    HStack(spacing: 6) {
-                        Circle().fill(statusLabel.1).frame(width: 9, height: 9)
-                        Text(statusLabel.0)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                SettingsCard(title: "扫描仪") {
+                    SettingRow(label: "地址") {
+                        TextField("", text: $m.host, prompt: Text("例如 192.168.1.20"))
+                            .textFieldStyle(.plain)
+                            .multilineTextAlignment(.trailing)
+                            .frame(maxWidth: 190)
                     }
-                }
-                LabeledContent("自动进纸器") { Text(m.adfLoaded ? "已放入纸张" : "无纸张") }
-                HStack {
-                    Button(m.searching ? "正在查找…" : "自动查找扫描仪") { m.discover() }
-                        .disabled(m.searching)
-                    if m.searching { ProgressView().controlSize(.small) }
-                }
-                ForEach(m.found) { f in
-                    Button { m.host = f.id } label: {
-                        HStack {
-                            Image(systemName: m.host == f.id ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(m.host == f.id ? Color.accentColor : Color.secondary)
-                            Text("\(f.model)  ·  \(f.id)")
-                                .foregroundStyle(Color.primary)
-                                .multilineTextAlignment(.leading)
+                    SettingRow(label: "状态") {
+                        HStack(spacing: 6) {
+                            Circle().fill(statusLabel.1).frame(width: 8, height: 8)
+                            Text(statusLabel.0).foregroundStyle(.secondary)
                         }
                     }
-                    .buttonStyle(.borderless)
+                    SettingRow(label: "自动进纸器") {
+                        Text(m.adfLoaded ? "已放入纸张" : "无纸张").foregroundStyle(.secondary)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Button(m.searching ? "正在查找…" : "自动查找扫描仪") { m.discover() }
+                                .disabled(m.searching)
+                            if m.searching { ProgressView().controlSize(.small) }
+                        }
+                        ForEach(m.found) { f in
+                            Button { m.host = f.id } label: {
+                                HStack(alignment: .top) {
+                                    Image(systemName: m.host == f.id ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(m.host == f.id ? Color.accentColor : Color.secondary)
+                                    Text("\(f.model)  ·  \(f.id)")
+                                        .foregroundStyle(Color.primary)
+                                        .multilineTextAlignment(.leading)
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-            }
 
-            Section {
-                Picker("来源", selection: $m.source) {
-                    ForEach(SourceChoice.allCases) { Text($0.label).tag($0) }
+                SettingsCard(title: "扫描",
+                             footer: "来源为「自动选择」时：自动进纸器中有纸张则从进纸器扫描（可连续扫描多页），否则从平板扫描。自动进纸器最高支持 300 dpi。") {
+                    SettingRow(label: "来源") {
+                        Picker("", selection: $m.source) {
+                            ForEach(SourceChoice.allCases) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden().fixedSize()
+                    }
+                    SettingRow(label: "颜色") {
+                        Picker("", selection: $m.color) {
+                            ForEach(ColorChoice.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().fixedSize()
+                    }
+                    SettingRow(label: "分辨率") {
+                        Picker("", selection: $m.dpi) {
+                            Text("75 dpi · 预览").tag(75)
+                            Text("200 dpi · 较小文件").tag(200)
+                            Text("300 dpi · 推荐").tag(300)
+                            Text("600 dpi · 高精度（仅平板）").tag(600)
+                        }
+                        .labelsHidden().fixedSize()
+                    }
+                    SettingRow(label: "纸张", last: true) {
+                        Picker("", selection: $m.paper) {
+                            ForEach(PaperChoice.allCases) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden().fixedSize()
+                    }
                 }
-                Picker("颜色", selection: $m.color) {
-                    ForEach(ColorChoice.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                Picker("分辨率", selection: $m.dpi) {
-                    Text("75 dpi · 预览").tag(75)
-                    Text("200 dpi · 较小文件").tag(200)
-                    Text("300 dpi · 推荐").tag(300)
-                    Text("600 dpi · 高精度（仅平板）").tag(600)
-                }
-                Picker("纸张", selection: $m.paper) {
-                    ForEach(PaperChoice.allCases) { Text($0.label).tag($0) }
-                }
-            } header: {
-                Text("扫描")
-            } footer: {
-                Text("来源为「自动选择」时：自动进纸器中有纸张则从进纸器扫描（可连续扫描多页），否则从平板扫描。自动进纸器最高支持 300 dpi。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
 
-            Section {
-                Picker("背景", selection: $m.bg) {
-                    ForEach(BgChoice.allCases) { Text($0.label).tag($0) }
+                SettingsCard(title: "图像处理",
+                             footer: "文字与表格请选择「文档」；护照、证件和照片请选择「证件与照片」，以保留彩色底纹。修改设置后，已扫描的页面将自动重新处理。") {
+                    SettingRow(label: "背景") {
+                        Picker("", selection: $m.bg) {
+                            ForEach(BgChoice.allCases) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 240)
+                    }
+                    SettingRow(label: "自动裁除四周空白（适用于护照、证件、票据）") { SettingSwitch(isOn: $m.autoCrop) }
+                    SettingRow(label: "去除污点和灰尘") {
+                        SettingSwitch(isOn: $m.despeckle).disabled(m.bg != .document && m.color != .bw)
+                    }
+                    SettingRow(label: "自动校正方向（依据文字方向）", last: true) { SettingSwitch(isOn: $m.autoRotate) }
                 }
-                Toggle("自动裁除四周空白（适用于护照、证件、票据）", isOn: $m.autoCrop)
-                Toggle("去除污点和灰尘", isOn: $m.despeckle)
-                    .disabled(m.bg != .document && m.color != .bw)
-                Toggle("自动校正方向（依据文字方向）", isOn: $m.autoRotate)
-            } header: {
-                Text("图像处理")
-            } footer: {
-                Text("文字与表格请选择「文档」；护照、证件和照片请选择「证件与照片」，以保留彩色底纹。修改设置后，已扫描的页面将自动重新处理。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
 
-            Section("输出") {
-                LabeledContent("保存位置") {
-                    Text((m.outputDir as NSString).abbreviatingWithTildeInPath)
-                        .lineLimit(1).truncationMode(.middle)
+                SettingsCard(title: "输出") {
+                    SettingRow(label: "保存位置") {
+                        Text((m.outputDir as NSString).abbreviatingWithTildeInPath)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    VStack(spacing: 0) {
+                        HStack {
+                            Button("选择文件夹…") { m.chooseFolder() }
+                            Button("在访达中打开") { NSWorkspace.shared.open(m.outputURL) }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        Divider().padding(.leading, 12)
+                    }
+                    SettingRow(label: "文件质量") {
+                        Picker("", selection: $m.quality) {
+                            ForEach(QualityChoice.allCases) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden().fixedSize()
+                    }
+                    SettingRow(label: "保存后在访达中显示") { SettingSwitch(isOn: $m.revealAfterSave) }
+                    SettingRow(label: "保存后清空已扫描页面") { SettingSwitch(isOn: $m.clearAfterSave) }
+                    SettingRow(label: "删除页面、保存文件前确认", last: true) { SettingSwitch(isOn: $m.confirmActions) }
                 }
-                HStack {
-                    Button("选择文件夹…") { m.chooseFolder() }
-                    Button("在访达中打开") { NSWorkspace.shared.open(m.outputURL) }
-                }
-                Picker("文件质量", selection: $m.quality) {
-                    ForEach(QualityChoice.allCases) { Text($0.label).tag($0) }
-                }
-                Toggle("保存后在访达中显示", isOn: $m.revealAfterSave)
-                Toggle("保存后清空已扫描页面", isOn: $m.clearAfterSave)
             }
+            .padding(16)
         }
-        .formStyle(.grouped)
     }
 }
 
@@ -1261,7 +1503,7 @@ struct PageCard: View {
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
-                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.10))
+                RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.thumbBackdrop)
                 if let t = page.thumb {
                     Image(nsImage: t)
                         .resizable()
@@ -1284,13 +1526,13 @@ struct PageCard: View {
                 IconButton(symbol: "arrow.left", tip: "前移") { m.move(page.id, -1) }.disabled(index == 0)
                 IconButton(symbol: "rotate.left", tip: "向左旋转 90°") { m.rotate(page.id, -90) }
                 IconButton(symbol: "rotate.right", tip: "向右旋转 90°") { m.rotate(page.id, 90) }
-                IconButton(symbol: "trash", tip: "删除此页") { m.delete(page.id) }
+                IconButton(symbol: "trash", tip: "删除此页") { m.requestDelete(page.id) }
                 IconButton(symbol: "arrow.right", tip: "后移") { m.move(page.id, 1) }.disabled(index == count - 1)
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.cardStroke, lineWidth: 1))
     }
 }
 
@@ -1326,7 +1568,7 @@ struct BottomBar: View {
                 .fixedSize()
                 .disabled(m.pages.isEmpty || m.busy)
                 .help("将已扫描的页面插入现有 PDF 文件的指定位置")
-            Button { m.save() } label: {
+            Button { m.requestSave() } label: {
                 Label("保存", systemImage: "square.and.arrow.down").frame(minWidth: 60)
             }
             .buttonStyle(.borderedProminent)
@@ -1343,6 +1585,7 @@ struct PreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State var currentID: UUID
     @State private var big: NSImage?
+    @State private var confirmDelete = false
 
     var index: Int? { m.pages.firstIndex { $0.id == currentID } }
 
@@ -1358,14 +1601,16 @@ struct PreviewSheet: View {
                 Divider().frame(height: 18)
                 IconButton(symbol: "rotate.left", tip: "向左旋转 90°") { m.rotate(currentID, -90) }
                 IconButton(symbol: "rotate.right", tip: "向右旋转 90°") { m.rotate(currentID, 90) }
-                IconButton(symbol: "trash", tip: "删除此页") { deleteCurrent() }
+                IconButton(symbol: "trash", tip: "删除此页") {
+                    if m.confirmActions { confirmDelete = true } else { deleteCurrent() }
+                }
                 Divider().frame(height: 18)
                 Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             .padding(12)
             Divider()
             ZStack {
-                Color(nsColor: .underPageBackgroundColor)
+                Theme.thumbBackdrop
                 if let b = big {
                     Image(nsImage: b).resizable().interpolation(.high).aspectRatio(contentMode: .fit).padding(16)
                 } else {
@@ -1375,6 +1620,10 @@ struct PreviewSheet: View {
         }
         .frame(minWidth: 760, idealWidth: 860, minHeight: 820, idealHeight: 960)
         .task(id: renderKey) { await render() }
+        .confirmationDialog("确定删除第 \((index ?? 0) + 1) 页？", isPresented: $confirmDelete) {
+            Button("删除", role: .destructive) { deleteCurrent() }
+            Button("取消", role: .cancel) {}
+        } message: { Text("删除后无法恢复。") }
     }
 
     var renderKey: String {
@@ -1449,6 +1698,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 调试用：SCAN_TEST_IMAGES=图1,图2 预先放入页面；SCAN_SNAPSHOT=输出.png 几秒后把窗口截图并退出
     func applicationDidFinishLaunching(_ notification: Notification) {
         let env = ProcessInfo.processInfo.environment
+        // 调试：SCAN_APPEARANCE=dark / light 强制外观
+        if let a = env["SCAN_APPEARANCE"] { NSApp.appearance = NSAppearance(named: a == "dark" ? .darkAqua : .aqua) }
         if let list = env["SCAN_TEST_IMAGES"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 for path in list.split(separator: ",") {
@@ -1470,6 +1721,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     w.center()
                 }
                 w.makeFirstResponder(nil)
+                // SCAN_TEST_ACTION=save / delete：截图前触发保存确认或删除确认，用于检查确认框
+                switch env["SCAN_TEST_ACTION"] {
+                case "save": AppModel.shared?.requestSave()
+                case "delete": if let id = AppModel.shared?.pages.first?.id { AppModel.shared?.requestDelete(id) }
+                default: break
+                }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard let w = NSApp.windows.first(where: { $0.isVisible }), let content = w.contentView else { exit(3) }
@@ -1478,6 +1735,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber),
                                                     [.boundsIgnoreFraming, .bestResolution]), cg.width > 10 {
                     try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+                    // 有弹出的确认框（sheet）时另存一张
+                    if let sheet = w.attachedSheet,
+                       let sc = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(sheet.windowNumber),
+                                                        [.boundsIgnoreFraming, .bestResolution]) {
+                        let sheetOut = (out as NSString).deletingPathExtension + "_sheet.png"
+                        try? NSBitmapImageRep(cgImage: sc).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: sheetOut))
+                    }
                     if let f = oldFrame { w.setFrame(f, display: false) }
                     exit(0)
                 }

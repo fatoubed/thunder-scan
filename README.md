@@ -4,9 +4,12 @@ macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint �
 
 本软件不依赖打印机厂商驱动，也不依赖 Bonjour 服务发现：在启用代理软件（如 ClashX）导致系统无法发现打印机的情况下，仍可通过网段探测找到扫描仪。
 
-![雷霆扫描界面](docs/screenshot.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <img alt="雷霆扫描界面" src="docs/screenshot.png">
+</picture>
 
-<sub>截图中的文档、地址均为演示用示例内容。</sub>
+<sub>截图中的文档、地址均为演示用示例内容。GitHub 使用暗色主题时显示暗色模式截图。</sub>
 
 ## 功能
 
@@ -23,6 +26,8 @@ macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint �
 - **输出**：保存为多页 PDF（JPEG 压缩，三档质量）或每页一张 JPG，可指定保存位置
 - **插入到现有 PDF**：将扫描页面插入现有 PDF 文件的指定位置，原文件先移至废纸篓备份
 - **自动查找扫描仪**：在本机所在网段中探测 eSCL 设备
+- **操作确认**：删除页面、保存文件前弹出确认（可在设置中关闭）；保存确认会列出页数、文件名与保存位置
+- **外观**：适配浅色与暗色模式；macOS 26 及更高版本使用毛玻璃背景，较早版本使用不受壁纸染色影响的中性配色
 
 ## 系统要求
 
@@ -48,7 +53,7 @@ macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint �
 
 ```bash
 bash build.sh      # 编译通用版（x86_64 + arm64），安装到 ~/Desktop/雷霆扫描.app
-bash package.sh    # 编译并打包为 ~/Desktop/雷霆扫描-安装包.dmg
+bash package.sh    # 编译并打包为 build/雷霆扫描-安装包.dmg
 ```
 
 `build.sh` 可接受一个参数作为安装位置，例如 `bash build.sh /Applications/雷霆扫描.app`。
@@ -65,7 +70,16 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 
 `Scanner` 位于 `雷霆扫描.app/Contents/MacOS/` 目录下。
 
-调试用环境变量：`SCAN_DEMO=1` 启用演示模式（显示示例地址，不连接真实设备）；`SCAN_TEST_IMAGES=图1,图2` 预先载入页面；`SCAN_SNAPSHOT=输出.png`（可配合 `SCAN_SNAPSHOT_SIZE=宽x高`、`SCAN_SNAPSHOT_DELAY=秒`）在启动后截取窗口并退出。
+调试用环境变量：
+
+| 变量 | 作用 |
+| --- | --- |
+| `SCAN_DEMO=1` | 演示模式：显示示例地址，不连接真实设备 |
+| `SCAN_TEST_IMAGES=图1,图2` | 启动后预先载入页面 |
+| `SCAN_SNAPSHOT=输出.png` | 启动后截取窗口并退出；可配合 `SCAN_SNAPSHOT_SIZE=宽x高`、`SCAN_SNAPSHOT_DELAY=秒` |
+| `SCAN_TEST_ACTION=save` / `delete` | 截图前触发保存确认或删除确认，确认框另存为 `*_sheet.png` |
+| `SCAN_APPEARANCE=light` / `dark` | 强制浅色或暗色外观 |
+| `SCAN_STYLE=glass` / `plain` | 强制使用毛玻璃或中性配色背景 |
 
 ## 文件
 
@@ -76,7 +90,7 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 | `package.sh` | 打包 DMG |
 | `make_icon.swift` | 生成图标 |
 | `使用说明.txt` | 面向最终用户的中文说明（随 DMG 分发） |
-| `docs/screenshot.png` | README 截图 |
+| `docs/screenshot.png`、`docs/screenshot-dark.png` | README 截图（浅色、暗色） |
 
 ## 开源协议
 
