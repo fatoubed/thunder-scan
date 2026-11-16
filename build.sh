@@ -1,6 +1,7 @@
 #!/bin/bash
 # 编译「雷霆扫描.app」并安装到桌面（旧版会先移到废纸篓）
 # 用法：bash build.sh [安装位置，默认 ~/Desktop/雷霆扫描.app]
+#       指定 SDK：SDKROOT=SDK路径 bash build.sh
 set -e
 cd "$(dirname "$0")"
 DEST="${1:-$HOME/Desktop/雷霆扫描.app}"
@@ -8,6 +9,33 @@ APP="build/雷霆扫描.app"
 
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# 选择 SDK：macOS 27 SDK 起 SwiftUI 的 @State 改为宏，只装命令行工具时缺少宏插件
+# （报错「plugin for module 'SwiftUIMacros' not found」）。此时改用本机较旧的 macOS SDK。
+# 已设置 SDKROOT 时不检测。
+sdk_ok() {
+  SDKROOT="$1" swiftc -parse-as-library -target arm64-apple-macos13.0 -typecheck build/sdk_probe.swift >/dev/null 2>&1
+}
+if [ -z "$SDKROOT" ]; then
+  printf 'import SwiftUI\nstruct P: View {\n  @State var n = 0\n  var body: some View { Button("") { n += 1 } }\n}\n' > build/sdk_probe.swift
+  DEFAULT_SDK="$(xcrun --show-sdk-path)"
+  if ! sdk_ok "$DEFAULT_SDK"; then
+    SDK_DIR="$(dirname "$DEFAULT_SDK")"
+    TRIED=" $(cd "$DEFAULT_SDK" && pwd -P) "
+    for name in $(ls "$SDK_DIR" | grep -E '^MacOSX[0-9.]+\.sdk$' | sort -rV); do
+      sdk="$(cd "$SDK_DIR/$name" && pwd -P)"
+      case "$TRIED" in *" $sdk "*) continue ;; esac
+      TRIED="$TRIED$sdk "
+      if sdk_ok "$sdk"; then export SDKROOT="$sdk"; break; fi
+    done
+    if [ -z "$SDKROOT" ]; then
+      echo "错误：默认 SDK 无法编译 SwiftUI 代码（可能缺少 SwiftUIMacros 宏插件），本机也没有可用的其他 macOS SDK。" >&2
+      echo "请安装完整的 Xcode，或用 SDKROOT=SDK路径 bash build.sh 指定 SDK。" >&2
+      exit 1
+    fi
+    echo "默认 SDK 缺少 SwiftUI 宏插件，改用 $(basename "$SDKROOT")"
+  fi
+fi
 
 echo "编译中（Intel + Apple 芯片）…"
 swiftc -O -parse-as-library -target x86_64-apple-macos13.0 ScanApp.swift -o build/Scanner-x86_64

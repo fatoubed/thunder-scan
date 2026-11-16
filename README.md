@@ -58,6 +58,8 @@ bash package.sh    # 编译并打包为 build/雷霆扫描-安装包.dmg
 
 `build.sh` 可接受一个参数作为安装位置，例如 `bash build.sh /Applications/雷霆扫描.app`。
 
+macOS 27 的命令行工具缺少 SwiftUI 宏插件（`SwiftUIMacros`），使用默认 SDK 无法编译；`build.sh` 会检测到这种情况，自动改用本机较旧的 macOS SDK。也可以用 `SDKROOT=SDK路径 bash build.sh` 手动指定 SDK。
+
 图标由 `make_icon.swift` 生成；删除 `AppIcon.icns` 后重新运行 `build.sh` 即可重新生成。
 
 ## 命令行（调试用）
