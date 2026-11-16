@@ -27,7 +27,7 @@ macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint �
 - **插入到现有 PDF**：将扫描页面插入现有 PDF 文件的指定位置，原文件先移至废纸篓备份
 - **自动查找扫描仪**：在本机所在网段中探测 eSCL 设备
 - **操作确认**：删除页面、保存文件前弹出确认（可在设置中关闭）；保存确认会列出页数、文件名与保存位置
-- **外观**：适配浅色与暗色模式；macOS 26 及更高版本使用毛玻璃背景，较早版本使用不受壁纸染色影响的中性配色
+- **外观**：适配浅色与暗色模式；macOS 26 及更高版本采用与访达一致的界面（毛玻璃侧栏、玻璃工具栏、浮动底栏，页面支持右键菜单），较早版本使用不受壁纸染色影响的中性配色
 
 ## 系统要求
 
@@ -81,7 +81,7 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 | `SCAN_SNAPSHOT=输出.png` | 启动后截取窗口并退出；可配合 `SCAN_SNAPSHOT_SIZE=宽x高`、`SCAN_SNAPSHOT_DELAY=秒` |
 | `SCAN_TEST_ACTION=save` / `delete` | 截图前触发保存确认或删除确认，确认框另存为 `*_sheet.png` |
 | `SCAN_APPEARANCE=light` / `dark` | 强制浅色或暗色外观 |
-| `SCAN_STYLE=glass` / `plain` | 强制使用毛玻璃或中性配色背景 |
+| `SCAN_STYLE=glass` / `plain` | 强制使用毛玻璃（macOS 26 及以上为访达式界面）或中性配色 |
 
 ## 文件
 

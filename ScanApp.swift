@@ -1107,6 +1107,14 @@ enum Theme {
         return v.majorVersion >= 26 || v.majorVersion == 16
     }()
 
+    /// 访达式布局（仅 macOS 26 及以上，且为毛玻璃风格）：原生分栏、浮动毛玻璃侧栏、玻璃工具栏与底栏
+    static let finder: Bool = {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) { return glass }
+        #endif
+        return false
+    }()
+
     static func dyn(_ light: NSColor, _ dark: NSColor) -> NSColor {
         NSColor(name: nil) { ap in ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light }
     }
@@ -1190,6 +1198,15 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
+/// 侧栏是否使用访达式样式（分组标题 + 图标行，无卡片）
+private struct FinderStyleKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var finderStyle: Bool {
+        get { self[FinderStyleKey.self] }
+        set { self[FinderStyleKey.self] = newValue }
+    }
+}
+
 // MARK: - 界面
 
 struct ContentView: View {
@@ -1199,36 +1216,7 @@ struct ContentView: View {
     struct PreviewItem: Identifiable { let id: UUID }
 
     var body: some View {
-        HStack(spacing: 0) {
-            SettingsPanel()
-                .frame(width: 340)
-                .background(AreaBackground(sidebar: true))
-            Divider().ignoresSafeArea()
-            VStack(spacing: 0) {
-                HStack {
-                    Text(m.pages.isEmpty ? "暂无扫描页面" : "已扫描 \(m.pages.count) 页")
-                        .font(.headline)
-                    if m.pages.contains(where: { $0.processing }) {
-                        ProgressView().controlSize(.small)
-                        Text("处理中…").foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if !m.pages.isEmpty {
-                        Text("点击页面可放大预览").foregroundStyle(.secondary).font(.callout)
-                        Button(role: .destructive) { confirmClear = true } label: { Label("清空全部", systemImage: "trash") }
-                            .disabled(m.busy)
-                    }
-                }
-                .padding(.horizontal, 16).padding(.vertical, 10)
-                Divider()
-                PagesArea()
-                Divider()
-                BottomBar()
-            }
-            .background(AreaBackground(sidebar: false))
-        }
-        .frame(minWidth: 1080, minHeight: 680)
-        .background(WindowConfigurator())
+        layout
         .confirmationDialog("确定清空全部已扫描页面？", isPresented: $confirmClear) {
             Button("清空 \(m.pages.count) 页", role: .destructive) { m.clearAll() }
             Button("取消", role: .cancel) {}
@@ -1260,6 +1248,52 @@ struct ContentView: View {
             Button("确定") { m.alert = nil }
         } message: { Text(m.alert ?? "") }
     }
+
+    /// macOS 26 及以上使用访达式布局，其余版本保持原布局
+    @ViewBuilder var layout: some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *), Theme.finder {
+            FinderLayout(confirmClear: $confirmClear)
+        } else {
+            classicLayout
+        }
+        #else
+        classicLayout
+        #endif
+    }
+
+    var classicLayout: some View {
+        HStack(spacing: 0) {
+            SettingsPanel()
+                .frame(width: 340)
+                .background(AreaBackground(sidebar: true))
+            Divider().ignoresSafeArea()
+            VStack(spacing: 0) {
+                HStack {
+                    Text(m.pages.isEmpty ? "暂无扫描页面" : "已扫描 \(m.pages.count) 页")
+                        .font(.headline)
+                    if m.pages.contains(where: { $0.processing }) {
+                        ProgressView().controlSize(.small)
+                        Text("处理中…").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if !m.pages.isEmpty {
+                        Text("点击页面可放大预览").foregroundStyle(.secondary).font(.callout)
+                        Button(role: .destructive) { confirmClear = true } label: { Label("清空全部", systemImage: "trash") }
+                            .disabled(m.busy)
+                    }
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                Divider()
+                PagesArea()
+                Divider()
+                BottomBar()
+            }
+            .background(AreaBackground(sidebar: false))
+        }
+        .frame(minWidth: 1080, minHeight: 680)
+        .background(WindowConfigurator())
+    }
 }
 
 /// 设置分组卡片
@@ -1267,8 +1301,31 @@ struct SettingsCard<Content: View>: View {
     let title: String
     var footer: String? = nil
     @ViewBuilder let content: () -> Content
+    @Environment(\.finderStyle) private var finder
 
     var body: some View {
+        if finder {
+            // 访达式：侧栏分组（分组标题可折叠），行直接放在毛玻璃上
+            // 侧栏样式不显示分组的 footer，说明文字作为分组的最后一行小字
+            Section {
+                content()
+                if let f = footer {
+                    Text(f)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(6)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, 2)
+                }
+            } header: {
+                Text(title)
+            }
+        } else {
+            card
+        }
+    }
+
+    var card: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
@@ -1291,10 +1348,32 @@ struct SettingsCard<Content: View>: View {
 /// 设置行：左侧标签，右侧控件
 struct SettingRow<Trailing: View>: View {
     let label: String
+    /// 访达式侧栏中显示的图标（SF Symbols）；原布局不显示
+    var icon: String? = nil
     var last = false
     @ViewBuilder let trailing: () -> Trailing
+    @Environment(\.finderStyle) private var finder
 
     var body: some View {
+        if finder {
+            HStack(spacing: 8) {
+                Label {
+                    Text(label)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: label.count <= 6, vertical: true)
+                } icon: {
+                    Image(systemName: icon ?? "circle").opacity(icon == nil ? 0 : 1)
+                }
+                Spacer(minLength: 8)
+                trailing()
+            }
+            .frame(minHeight: 26)
+        } else {
+            row
+        }
+    }
+
+    var row: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 // 短标签不换行；长标签允许换行
@@ -1319,6 +1398,7 @@ struct SettingSwitch: View {
 
 struct SettingsPanel: View {
     @EnvironmentObject var m: AppModel
+    @Environment(\.finderStyle) private var finder
 
     var statusLabel: (String, Color) {
         if m.host.trimmingCharacters(in: .whitespaces).isEmpty { return (m.searching ? "正在查找…" : "未设置", .gray) }
@@ -1334,22 +1414,39 @@ struct SettingsPanel: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+        if finder {
+            List { sections }
+                .listStyle(.sidebar)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) { sections }
+                    .padding(16)
+            }
+        }
+    }
+
+    @ViewBuilder var sections: some View {
                 SettingsCard(title: "扫描仪") {
-                    SettingRow(label: "地址") {
-                        TextField("", text: $m.host, prompt: Text("例如 192.168.1.20"))
-                            .textFieldStyle(.plain)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 190)
+                    SettingRow(label: "地址", icon: "network") {
+                        if finder {
+                            TextField("", text: $m.host, prompt: Text("例如 192.168.1.20"))
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 170)
+                        } else {
+                            TextField("", text: $m.host, prompt: Text("例如 192.168.1.20"))
+                                .textFieldStyle(.plain)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 190)
+                        }
                     }
-                    SettingRow(label: "状态") {
+                    SettingRow(label: "状态", icon: "printer") {
                         HStack(spacing: 6) {
                             Circle().fill(statusLabel.1).frame(width: 8, height: 8)
                             Text(statusLabel.0).foregroundStyle(.secondary)
                         }
                     }
-                    SettingRow(label: "自动进纸器") {
+                    SettingRow(label: "自动进纸器", icon: "tray.and.arrow.down") {
                         Text(m.adfLoaded ? "已放入纸张" : "无纸张").foregroundStyle(.secondary)
                     }
                     VStack(alignment: .leading, spacing: 8) {
@@ -1371,26 +1468,26 @@ struct SettingsPanel: View {
                             .buttonStyle(.borderless)
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
+                    .padding(.horizontal, finder ? 0 : 12)
+                    .padding(.vertical, finder ? 2 : 9)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 SettingsCard(title: "扫描",
                              footer: "来源为「自动选择」时：自动进纸器中有纸张则从进纸器扫描（可连续扫描多页），否则从平板扫描。自动进纸器最高支持 300 dpi。") {
-                    SettingRow(label: "来源") {
+                    SettingRow(label: "来源", icon: "scanner") {
                         Picker("", selection: $m.source) {
                             ForEach(SourceChoice.allCases) { Text($0.label).tag($0) }
                         }
                         .labelsHidden().fixedSize()
                     }
-                    SettingRow(label: "颜色") {
+                    SettingRow(label: "颜色", icon: "paintpalette") {
                         Picker("", selection: $m.color) {
                             ForEach(ColorChoice.allCases) { Text($0.label).tag($0) }
                         }
                         .pickerStyle(.segmented).labelsHidden().fixedSize()
                     }
-                    SettingRow(label: "分辨率") {
+                    SettingRow(label: "分辨率", icon: "viewfinder") {
                         Picker("", selection: $m.dpi) {
                             Text("75 dpi · 预览").tag(75)
                             Text("200 dpi · 较小文件").tag(200)
@@ -1399,7 +1496,7 @@ struct SettingsPanel: View {
                         }
                         .labelsHidden().fixedSize()
                     }
-                    SettingRow(label: "纸张", last: true) {
+                    SettingRow(label: "纸张", icon: "doc", last: true) {
                         Picker("", selection: $m.paper) {
                             ForEach(PaperChoice.allCases) { Text($0.label).tag($0) }
                         }
@@ -1409,22 +1506,22 @@ struct SettingsPanel: View {
 
                 SettingsCard(title: "图像处理",
                              footer: "文字与表格请选择「文档」；护照、证件和照片请选择「证件与照片」，以保留彩色底纹。修改设置后，已扫描的页面将自动重新处理。") {
-                    SettingRow(label: "背景") {
+                    SettingRow(label: "背景", icon: "wand.and.stars") {
                         Picker("", selection: $m.bg) {
                             ForEach(BgChoice.allCases) { Text($0.label).tag($0) }
                         }
                         .labelsHidden()
                         .frame(maxWidth: 240)
                     }
-                    SettingRow(label: "自动裁除四周空白（适用于护照、证件、票据）") { SettingSwitch(isOn: $m.autoCrop) }
-                    SettingRow(label: "去除污点和灰尘") {
+                    SettingRow(label: "自动裁除四周空白（适用于护照、证件、票据）", icon: "crop") { SettingSwitch(isOn: $m.autoCrop) }
+                    SettingRow(label: "去除污点和灰尘", icon: "sparkles") {
                         SettingSwitch(isOn: $m.despeckle).disabled(m.bg != .document && m.color != .bw)
                     }
-                    SettingRow(label: "自动校正方向（依据文字方向）", last: true) { SettingSwitch(isOn: $m.autoRotate) }
+                    SettingRow(label: "自动校正方向（依据文字方向）", icon: "rotate.right", last: true) { SettingSwitch(isOn: $m.autoRotate) }
                 }
 
                 SettingsCard(title: "输出") {
-                    SettingRow(label: "保存位置") {
+                    SettingRow(label: "保存位置", icon: "folder") {
                         Text((m.outputDir as NSString).abbreviatingWithTildeInPath)
                             .foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.middle)
@@ -1435,22 +1532,19 @@ struct SettingsPanel: View {
                             Button("在访达中打开") { NSWorkspace.shared.open(m.outputURL) }
                             Spacer()
                         }
-                        .padding(.horizontal, 12).padding(.vertical, 8)
-                        Divider().padding(.leading, 12)
+                        .padding(.horizontal, finder ? 0 : 12).padding(.vertical, finder ? 2 : 8)
+                        if !finder { Divider().padding(.leading, 12) }
                     }
-                    SettingRow(label: "文件质量") {
+                    SettingRow(label: "文件质量", icon: "slider.horizontal.3") {
                         Picker("", selection: $m.quality) {
                             ForEach(QualityChoice.allCases) { Text($0.label).tag($0) }
                         }
                         .labelsHidden().fixedSize()
                     }
-                    SettingRow(label: "保存后在访达中显示") { SettingSwitch(isOn: $m.revealAfterSave) }
-                    SettingRow(label: "保存后清空已扫描页面") { SettingSwitch(isOn: $m.clearAfterSave) }
-                    SettingRow(label: "删除页面、保存文件前确认", last: true) { SettingSwitch(isOn: $m.confirmActions) }
+                    SettingRow(label: "保存后在访达中显示", icon: "eye") { SettingSwitch(isOn: $m.revealAfterSave) }
+                    SettingRow(label: "保存后清空已扫描页面", icon: "trash") { SettingSwitch(isOn: $m.clearAfterSave) }
+                    SettingRow(label: "删除页面、保存文件前确认", icon: "checkmark.circle", last: true) { SettingSwitch(isOn: $m.confirmActions) }
                 }
-            }
-            .padding(16)
-        }
     }
 }
 
@@ -1579,6 +1673,193 @@ struct BottomBar: View {
         .padding(12)
     }
 }
+
+// MARK: - 访达式布局（macOS 26 及以上）
+
+#if compiler(>=6.2)
+/// 仿照访达：原生分栏（浮动毛玻璃侧栏放设置）、玻璃工具栏（标题、清空、扫描）、
+/// 页面区为纯色背景，底部为浮动玻璃栏（状态、文件名、格式、插入、保存）
+@available(macOS 26.0, *)
+struct FinderLayout: View {
+    @EnvironmentObject var m: AppModel
+    @Binding var confirmClear: Bool
+
+    var subtitle: String {
+        if m.pages.isEmpty { return "暂无扫描页面" }
+        let working = m.pages.contains { $0.processing }
+        return "已扫描 \(m.pages.count) 页" + (working ? " · 处理中…" : "")
+    }
+
+    var body: some View {
+        NavigationSplitView {
+            SettingsPanel()
+                .environment(\.finderStyle, true)
+                .toolbar(removing: .sidebarToggle)
+                // 必须放在 toolbar(removing:) 之后，否则宽度设置不生效
+                .navigationSplitViewColumnWidth(min: 340, ideal: 360, max: 460)
+        } detail: {
+            FinderPagesArea()
+                .safeAreaInset(edge: .bottom, spacing: 0) { GlassBottomBar() }
+                .navigationTitle("雷霆扫描")
+                .navigationSubtitle(subtitle)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button(role: .destructive) { confirmClear = true } label: {
+                            Label("清空全部", systemImage: "trash")
+                        }
+                        .help("清空全部已扫描页面")
+                        .disabled(m.pages.isEmpty || m.busy)
+                    }
+                    ToolbarSpacer(.fixed, placement: .primaryAction)
+                    ToolbarItem(placement: .primaryAction) {
+                        Button { m.scan() } label: {
+                            Label(m.isScanning ? "扫描中…" : "扫描", systemImage: "scanner")
+                                .labelStyle(.titleAndIcon)
+                                .padding(.horizontal, 4)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .help("扫描（⌘↩）")
+                        .disabled(m.busy)
+                    }
+                }
+        }
+        .frame(minWidth: 1180, minHeight: 720)
+    }
+}
+
+@available(macOS 26.0, *)
+struct FinderPagesArea: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        if m.pages.isEmpty {
+            ContentUnavailableView {
+                Label("放入文件，然后点击「扫描」", systemImage: "doc.viewfinder")
+            } description: {
+                Text("将文件放在平板上或放入自动进纸器。支持连续扫描多页，并合并保存为一个 PDF 文件。\n快捷键：⌘↩ 扫描　⌘S 保存")
+            } actions: {
+                Button { m.scan() } label: { Label("扫描", systemImage: "scanner").padding(.horizontal, 6) }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.large)
+                    .disabled(m.busy)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 18)], spacing: 22) {
+                    ForEach(Array(m.pages.enumerated()), id: \.element.id) { i, p in
+                        FinderPageItem(page: p, index: i, count: m.pages.count)
+                    }
+                }
+                .padding(20)
+            }
+        }
+    }
+}
+
+/// 页面缩略图：像访达的图标视图——无卡片底色，悬停时显示浅色圆角高亮；右键菜单提供全部操作
+@available(macOS 26.0, *)
+struct FinderPageItem: View {
+    @EnvironmentObject var m: AppModel
+    let page: ScanPage
+    let index: Int
+    let count: Int
+    @State private var hover = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                if let t = page.thumb {
+                    Image(nsImage: t)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .shadow(color: .black.opacity(0.22), radius: 3, y: 1)
+                } else {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous).fill(.quaternary)
+                        .aspectRatio(0.71, contentMode: .fit)
+                }
+                if page.processing {
+                    ProgressView().controlSize(.small)
+                        .padding(8)
+                        .glassEffect(.regular, in: .circle)
+                }
+            }
+            .frame(height: 236)
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(hover ? 0.07 : 0)))
+            .contentShape(Rectangle())
+            .onTapGesture { m.previewID = page.id }
+            .help("点击放大预览")
+            Text("第 \(index + 1) 页").font(.callout.weight(.medium))
+            HStack(spacing: 2) {
+                IconButton(symbol: "arrow.left", tip: "前移") { m.move(page.id, -1) }.disabled(index == 0)
+                IconButton(symbol: "rotate.left", tip: "向左旋转 90°") { m.rotate(page.id, -90) }
+                IconButton(symbol: "rotate.right", tip: "向右旋转 90°") { m.rotate(page.id, 90) }
+                IconButton(symbol: "trash", tip: "删除此页") { m.requestDelete(page.id) }
+                IconButton(symbol: "arrow.right", tip: "后移") { m.move(page.id, 1) }.disabled(index == count - 1)
+            }
+            .foregroundStyle(.secondary)
+        }
+        .onHover { hover = $0 }
+        .contextMenu {
+            Button("放大预览") { m.previewID = page.id }
+            Divider()
+            Button("向左旋转 90°") { m.rotate(page.id, -90) }
+            Button("向右旋转 90°") { m.rotate(page.id, 90) }
+            Divider()
+            Button("前移") { m.move(page.id, -1) }.disabled(index == 0)
+            Button("后移") { m.move(page.id, 1) }.disabled(index == count - 1)
+            Divider()
+            Button("删除此页", role: .destructive) { m.requestDelete(page.id) }
+        }
+    }
+}
+
+/// 浮动玻璃底栏：页面在其下方滚动
+@available(macOS 26.0, *)
+struct GlassBottomBar: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                if m.busy { ProgressView().controlSize(.small) }
+                Text(m.statusText)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            TextField("文件名（留空则按时间命名）", text: $m.fileName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 200)
+            Picker("", selection: $m.format) {
+                ForEach(FormatChoice.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 100)
+            .help("PDF：所有页面合并为一个文件；JPG：每页保存为一张图片")
+            Button("插入到现有 PDF…") { m.chooseInsertTarget() }
+                .fixedSize()
+                .disabled(m.pages.isEmpty || m.busy)
+                .help("将已扫描的页面插入现有 PDF 文件的指定位置")
+            Button { m.requestSave() } label: {
+                Label("保存", systemImage: "square.and.arrow.down").padding(.horizontal, 4)
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(m.pages.isEmpty || m.busy)
+        }
+        .padding(.leading, 18).padding(.trailing, 8).padding(.vertical, 8)
+        .glassEffect(.regular, in: .capsule)
+        .padding(.horizontal, 16).padding(.bottom, 14).padding(.top, 6)
+    }
+}
+#endif
 
 struct PreviewSheet: View {
     @EnvironmentObject var m: AppModel
