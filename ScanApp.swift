@@ -1318,7 +1318,11 @@ struct SettingsCard<Content: View>: View {
                         .padding(.vertical, 2)
                 }
             } header: {
+                // 分组标题：比系统默认（约 11pt）大，上下留出更多间距
                 Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .padding(.top, 14)
+                    .padding(.bottom, 6)
             }
         } else {
             card
