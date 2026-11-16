@@ -47,6 +47,10 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 
 `Scanner` 在 `雷霆扫描.app/Contents/MacOS/` 里。
 
+## 下载
+
+到 [Releases](https://github.com/fatoubed/thunder-scan/releases) 下载最新的 DMG 安装包，打开后把「雷霆扫描」拖进「应用程序」。
+
 ## 首次打开
 
 没有做苹果开发者认证，第一次打开会被 Gatekeeper 拦下：右键 → 打开；macOS 15 及以后需要到「系统设置 → 隐私与安全性」点「仍要打开」。详见 [使用说明.txt](使用说明.txt)。
@@ -60,3 +64,7 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 | `package.sh` | 打包 DMG |
 | `make_icon.swift` | 生成图标 |
 | `使用说明.txt` | 给最终用户的中文说明（会放进 DMG） |
+
+## 开源协议
+
+[MIT](LICENSE)
