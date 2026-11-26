@@ -447,16 +447,120 @@ enum ImageOps {
     /// 把 PDF 某一页渲染成图片（命令行测试用）
     static func renderPDF(_ url: URL, page: Int, dpi: Int) -> CGImage? {
         guard let doc = PDFDocument(url: url), let pg = doc.page(at: page) else { return nil }
-        let box = pg.bounds(for: .mediaBox)
-        let s = Double(dpi) / 72
-        let w = Int(box.width * s), h = Int(box.height * s)
-        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
-                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        return renderPDFPage(pg, dpi: dpi)
+    }
+
+    /// 渲染 PDF 页面（按裁切框，含页面自带的旋转）；页面很大时降低分辨率，单边不超过 7000 像素
+    static func renderPDFPage(_ pg: PDFPage, dpi: Int) -> CGImage? {
+        let box = pg.bounds(for: .cropBox)
+        let quarter = ((pg.rotation % 360) + 360) % 360 / 90
+        let pw = quarter % 2 == 0 ? box.width : box.height, ph = quarter % 2 == 0 ? box.height : box.width
+        guard pw > 0, ph > 0 else { return nil }
+        let s = min(Double(dpi) / 72, 7000 / Double(max(pw, ph)))
+        let w = Int(pw * s), h = Int(ph * s)
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
         ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         ctx.scaleBy(x: s, y: s)
-        pg.draw(with: .mediaBox, to: ctx)
+        pg.draw(with: .cropBox, to: ctx)   // 会自行处理页面旋转和裁切框原点
         return ctx.makeImage()
+    }
+
+    /// 读取图片文件：按照片自带的方向信息摆正；超大图片缩到单边 7000 像素以内。
+    /// 返回图片和推算的分辨率（手机照片没有可信的 dpi，按长边对应 A4 长边估算）
+    static func loadImage(_ url: URL) -> (CGImage, Int)? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let pw = props[kCGImagePropertyPixelWidth] as? Int, let ph = props[kCGImagePropertyPixelHeight] as? Int
+        else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: min(max(pw, ph), 7000),
+        ]
+        guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        let long = Double(max(img.width, img.height))
+        var dpi = Int((props[kCGImagePropertyDPIWidth] as? Double) ?? 0)
+        if dpi < 150 || dpi > 1200 { dpi = Int(long / 11.69) }
+        return (img, min(1200, max(100, dpi)))
+    }
+
+    /// 墨迹比例：缩小后按纸面亮度（中位数）找明显更暗的像素，忽略四周 4% 的边缘阴影
+    static func inkRatio(_ img: CGImage) -> Double {
+        let small = scaled(img, maxSide: 1000)
+        let w = small.width, h = small.height
+        var g = [UInt8](repeating: 255, count: w * h)
+        g.withUnsafeMutableBytes { p in
+            guard let ctx = CGContext(data: p.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                                      space: grayCS, bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+            ctx.draw(small, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        let mx = w * 4 / 100, my = h * 4 / 100
+        guard w > mx * 2 + 10, h > my * 2 + 10 else { return 1 }
+        var hist = [Int](repeating: 0, count: 256), total = 0
+        for y in my..<(h - my) { for x in mx..<(w - mx) { hist[Int(g[y * w + x])] += 1; total += 1 } }
+        let paper = percentile(hist, total, 0.5)
+        let cut = min(paper - 60, 200)
+        guard cut > 0 else { return 1 }
+        let dark = hist[0..<cut].reduce(0, +)
+        return Double(dark) / Double(total)
+    }
+
+    /// 空白页：墨迹少于万分之三（实测：几个零星污点约 0.0001，一行签名约 0.001）
+    static func isBlank(_ img: CGImage) -> Bool { inkRatio(img) < 0.0003 }
+
+    // MARK: 文字识别
+
+    struct TextLine { let text: String; let box: CGRect }   // box 为 0–1 的归一化坐标，原点在左下
+
+    /// 识别图片中的文字（简体中文 + 英文），按从上到下、从左到右排序
+    static func recognizeText(_ img: CGImage) -> [TextLine] {
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        req.recognitionLanguages = ["zh-Hans", "en-US"]
+        // 自动判断语言：中英混排时英文更准（实测 dpi、型号等不再被识别成拼音或错字）
+        req.automaticallyDetectsLanguage = true
+        try? VNImageRequestHandler(cgImage: img, options: [:]).perform([req])
+        let lines = (req.results ?? []).compactMap { o -> TextLine? in
+            guard let c = o.topCandidates(1).first, !c.string.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+            return TextLine(text: c.string, box: o.boundingBox)
+        }
+        return lines.sorted {
+            let a = Int(($0.box.midY * 120).rounded()), b = Int(($1.box.midY * 120).rounded())
+            return a != b ? a > b : $0.box.minX < $1.box.minX
+        }
+    }
+
+    static func plainText(_ lines: [TextLine]) -> String { lines.map(\.text).joined(separator: "\n") }
+
+    // MARK: 证件正反面
+
+    /// 从整块玻璃板的扫描图中取出证件：白底变纯白（保留证件底纹）后裁去四周空白，再按文字方向摆正
+    static func extractCard(_ img: CGImage, dpi: Int, color: ColorChoice) -> CGImage {
+        let s = ProcSettings(bg: .light, color: color == .bw ? .gray : color, autoCrop: true, despeckle: false)
+        let card = process(img, dpi: dpi, s: s)
+        return rotate(card, detectRotation(card))
+    }
+
+    /// 把证件正反面按实际大小上下排在一张 A4 上（证件比半页大时等比缩小）
+    static func composeCards(_ front: CGImage, _ back: CGImage, dpi: Int) -> CGImage {
+        let W = Int(8.27 * Double(dpi)), H = Int(11.69 * Double(dpi))
+        let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .high
+        let margin = Double(dpi) * 0.5
+        let slotW = Double(W) - margin * 2, slotH = Double(H) / 2 - margin * 1.5
+        // 上半页放正面，下半页放反面；CGContext 原点在左下
+        for (img, centerY) in [(front, Double(H) * 0.72), (back, Double(H) * 0.28)] {
+            let k = min(1, slotW / Double(img.width), slotH / Double(img.height))
+            let w = Double(img.width) * k, h = Double(img.height) * k
+            ctx.draw(img, in: CGRect(x: (Double(W) - w) / 2, y: centerY - h / 2, width: w, height: h))
+        }
+        return ctx.makeImage()!
     }
 }
 
@@ -475,9 +579,18 @@ enum Exporter {
         return url
     }
 
-    static func writePDF(_ items: [Item], quality: Double, to url: URL) throws {
-        guard let ctx = CGContext(url as CFURL, mediaBox: nil, nil) else { throw AppError("无法创建 PDF 文件：\(url.path)") }
-        for it in items {
+    /// 写 PDF。ocr：识别文字并以不可见文字层写入（可搜索、可复制）；password：设置打开密码。
+    /// progress(第几页, 共几页) 在识别文字时回调
+    static func writePDF(_ items: [Item], quality: Double, ocr: Bool = false, password: String? = nil,
+                         progress: ((Int, Int) -> Void)? = nil, to url: URL) throws {
+        var info: [CFString: Any] = [kCGPDFContextCreator: "雷霆扫描"]
+        if let pw = password, !pw.isEmpty {
+            info[kCGPDFContextUserPassword] = pw
+            info[kCGPDFContextOwnerPassword] = pw
+            info[kCGPDFContextEncryptionKeyLength] = 128
+        }
+        guard let ctx = CGContext(url as CFURL, mediaBox: nil, info as CFDictionary) else { throw AppError("无法创建 PDF 文件：\(url.path)") }
+        for (i, it) in items.enumerated() {
             let img = ImageOps.rotate(it.image, it.rotation)
             let data = ImageOps.jpegData(img, quality: quality, dpi: it.dpi)
             guard let prov = CGDataProvider(data: data as CFData),
@@ -487,15 +600,45 @@ enum Exporter {
             let boxData = Data(bytes: &box, count: MemoryLayout<CGRect>.size) as CFData
             ctx.beginPDFPage([kCGPDFContextMediaBox as String: boxData] as CFDictionary)
             ctx.draw(jimg, in: box)
+            if ocr {
+                progress?(i + 1, items.count)
+                drawInvisibleText(ImageOps.recognizeText(img), in: box, ctx: ctx)
+            }
             ctx.endPDFPage()
         }
         ctx.closePDF()
     }
 
-    static func export(_ items: [Item], format: FormatChoice, quality: Double, dir: URL, name: String) throws -> [URL] {
+    /// 在页面上按识别到的位置写入不可见文字：看不到，但能搜索、选中和复制
+    static func drawInvisibleText(_ lines: [ImageOps.TextLine], in page: CGRect, ctx: CGContext) {
+        guard !lines.isEmpty else { return }
+        ctx.saveGState()
+        ctx.setTextDrawingMode(.invisible)
+        ctx.textMatrix = .identity
+        for l in lines {
+            let r = CGRect(x: page.minX + l.box.minX * page.width, y: page.minY + l.box.minY * page.height,
+                           width: l.box.width * page.width, height: l.box.height * page.height)
+            guard r.width > 1, r.height > 1 else { continue }
+            // 用冬青黑体：苹方、黑体、宋体的文字层在页面被插入其他 PDF 后，「工门用月日」等字会变成康熙部首字符，导致搜不到
+            let font = CTFontCreateWithName("HiraginoSansGB-W3" as CFString, r.height * 0.82, nil)
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: l.text, attributes: [.font: font]))
+            let natural = CTLineGetTypographicBounds(line, nil, nil, nil)
+            guard natural > 0 else { continue }
+            ctx.saveGState()
+            ctx.translateBy(x: r.minX, y: r.minY + r.height * 0.18)
+            ctx.scaleBy(x: r.width / CGFloat(natural), y: 1)
+            ctx.textPosition = .zero
+            CTLineDraw(line, ctx)
+            ctx.restoreGState()
+        }
+        ctx.restoreGState()
+    }
+
+    static func export(_ items: [Item], format: FormatChoice, quality: Double, dir: URL, name: String,
+                       ocr: Bool = false, password: String? = nil, progress: ((Int, Int) -> Void)? = nil) throws -> [URL] {
         if format == .pdf {
             let url = uniqueURL(dir, name, "pdf")
-            try writePDF(items, quality: quality, to: url)
+            try writePDF(items, quality: quality, ocr: ocr, password: password, progress: progress, to: url)
             return [url]
         }
         var urls: [URL] = []
@@ -509,10 +652,11 @@ enum Exporter {
     }
 
     /// 插入到已有 PDF：原文件先移到废纸篓备份，再写入新版本
-    static func insert(_ items: [Item], quality: Double, into target: URL, after: Int) throws {
+    static func insert(_ items: [Item], quality: Double, ocr: Bool = false, progress: ((Int, Int) -> Void)? = nil,
+                       into target: URL, after: Int) throws {
         let tmpNew = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
         defer { try? FileManager.default.removeItem(at: tmpNew) }
-        try writePDF(items, quality: quality, to: tmpNew)
+        try writePDF(items, quality: quality, ocr: ocr, progress: progress, to: tmpNew)
         guard let doc = PDFDocument(url: target) else { throw AppError("无法打开 PDF 文件：\(target.lastPathComponent)") }
         if doc.isLocked { throw AppError("该 PDF 文件受密码保护，无法插入页面。") }
         guard let add = PDFDocument(url: tmpNew) else { throw AppError("生成扫描页面失败。") }
@@ -711,6 +855,10 @@ struct ScanPage: Identifiable {
     var thumb: NSImage?
     var processing = true
     var oriented = false
+    /// 已处理好的页面（如证件正反面拼版），不再走背景处理和裁切流程
+    var locked = false
+    /// 可能是空白页（墨迹极少）
+    var blank = false
 }
 
 @MainActor
@@ -756,6 +904,29 @@ final class AppModel: ObservableObject {
     @Published var appendPageCount = 0
     @Published var appendAfter = 0
 
+    /// 保存 PDF 时识别文字（可搜索、可复制）
+    @Published var ocrPDF: Bool { didSet { ud.set(ocrPDF, forKey: "ocr") } }
+    /// 保存 PDF 时设置打开密码（密码不保存，每次询问）
+    @Published var encryptPDF: Bool { didSet { ud.set(encryptPDF, forKey: "encrypt") } }
+    @Published var passwordRequest: ExportPurpose?
+    @Published var pendingDeleteBlank = false
+    @Published var isImporting = false
+    @Published var idStage: IDStage?
+    @Published var idFrontThumb: NSImage?
+
+    enum ExportPurpose: Identifiable {
+        case save(String), share
+        var id: String { if case .save(let n) = self { return "save-" + n }; return "share" }
+    }
+
+    enum IDStage: Equatable { case front, back, working(String) }
+
+    private var idFront: CGImage?
+    private var idToken = 0
+    private var printDoc: PDFDocument?
+    /// 文字识别模型是否已准备好（每个程序版本第一次使用时系统需要约半分钟到 1 分钟准备）
+    private var ocrReady = false
+
     private var queue: [UUID] = []
     private var working = false
     private var polling = false
@@ -783,6 +954,8 @@ final class AppModel: ObservableObject {
         revealAfterSave = bool("reveal", true)
         clearAfterSave = bool("clear", true)
         confirmActions = bool("confirm", true)
+        ocrPDF = bool("ocr", true)
+        encryptPDF = bool("encrypt", false)
         AppModel.shared = self
         // 演示模式（README 截图用）：显示示例地址与在线状态，不连接真实设备，不改动已保存的设置
         if ProcessInfo.processInfo.environment["SCAN_DEMO"] != nil {
@@ -806,6 +979,7 @@ final class AppModel: ObservableObject {
     func startPolling() {
         guard !polling, !demo else { return }
         polling = true
+        warmUpOCR()
         if host.trimmingCharacters(in: .whitespaces).isEmpty { discover(silent: true) }
         Task {
             while true {
@@ -918,17 +1092,19 @@ final class AppModel: ObservableObject {
         while !queue.isEmpty {
             let id = queue.removeFirst()
             guard let idx = pages.firstIndex(where: { $0.id == id }) else { continue }
-            let raw = pages[idx].raw, d = pages[idx].dpi, s = settings
-            let orient = autoRotate && !pages[idx].oriented
-            let (out, small, rot) = await Task.detached(priority: .userInitiated) { () -> (CGImage, CGImage, Int) in
-                let o = ImageOps.process(raw, dpi: d, s: s)
-                return (o, ImageOps.scaled(o, maxSide: 700), orient ? ImageOps.detectRotation(o) : 0)
+            let raw = pages[idx].raw, d = pages[idx].dpi, s = settings, locked = pages[idx].locked
+            let orient = autoRotate && !pages[idx].oriented && !locked
+            let (out, small, rot, blank) = await Task.detached(priority: .userInitiated) { () -> (CGImage, CGImage, Int, Bool) in
+                let o = locked ? raw : ImageOps.process(raw, dpi: d, s: s)
+                return (o, ImageOps.scaled(o, maxSide: 700), orient ? ImageOps.detectRotation(o) : 0,
+                        locked ? false : ImageOps.isBlank(o))
             }.value
             guard let i = pages.firstIndex(where: { $0.id == id }) else { continue }
             if orient && !pages[i].oriented {
                 pages[i].oriented = true
                 pages[i].rotation = rot
             }
+            pages[i].blank = blank
             pages[i].processed = out
             pages[i].small = small
             pages[i].thumb = NSImage(cgImage: ImageOps.rotate(small, pages[i].rotation), size: .zero)
@@ -1026,23 +1202,38 @@ final class AppModel: ObservableObject {
             s = "将 \(n) 页分别保存为 JPG 图片。\n文件名：\(name)_1.jpg 至 \(name)_\(n).jpg"
         }
         s += "\n保存位置：\(dir)\n如有同名文件，将自动添加编号，不会覆盖原文件。"
+        if format == .pdf && ocrPDF { s += "\nPDF 中的文字可搜索、可复制。" }
+        if format == .pdf && encryptPDF { s += "\n下一步将设置打开密码。" }
         if clearAfterSave { s += "\n保存后将清空已扫描页面。" }
         return s
     }
 
-    func save(name: String? = nil) {
+    /// 识别文字时更新状态栏
+    private func ocrProgress() -> (Int, Int) -> Void {
+        let ready = ocrReady
+        return { i, n in
+            Task { @MainActor in
+                AppModel.shared?.statusText = "正在识别文字（第 \(i)/\(n) 页）…" + (ready || i > 1 ? "" : "首次使用需要准备约 1 分钟")
+            }
+        }
+    }
+
+    func save(name: String? = nil, password: String? = nil) {
         guard !pages.isEmpty, !busy else { return }
+        let chosen = name ?? cleanName()
+        if format == .pdf && encryptPDF && password == nil { passwordRequest = .save(chosen); return }
         isSaving = true
         statusText = "正在保存…"
-        let chosen = name ?? cleanName()
         Task {
             await waitProcessing()
             let its = items(), q = quality.jpeg, fmt = format, dir = outputURL, name = chosen
+            let ocr = ocrPDF && fmt == .pdf, progress = ocrProgress()
             do {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 let urls = try await Task.detached(priority: .userInitiated) {
-                    try Exporter.export(its, format: fmt, quality: q, dir: dir, name: name)
+                    try Exporter.export(its, format: fmt, quality: q, dir: dir, name: name, ocr: ocr, password: password, progress: progress)
                 }.value
+                if ocr { ocrReady = true }
                 statusText = "已保存：\(urls[0].lastPathComponent)" + (urls.count > 1 ? " 等 \(urls.count) 个文件" : "")
                 if revealAfterSave { NSWorkspace.shared.activateFileViewerSelecting(urls) }
                 if clearAfterSave { pages.removeAll() }
@@ -1076,10 +1267,10 @@ final class AppModel: ObservableObject {
         statusText = "正在将页面插入 \(target.lastPathComponent)…"
         Task {
             await waitProcessing()
-            let its = items(), q = quality.jpeg, after = appendAfter
+            let its = items(), q = quality.jpeg, after = appendAfter, ocr = ocrPDF, progress = ocrProgress()
             do {
                 try await Task.detached(priority: .userInitiated) {
-                    try Exporter.insert(its, quality: q, into: target, after: after)
+                    try Exporter.insert(its, quality: q, ocr: ocr, progress: progress, into: target, after: after)
                 }.value
                 statusText = "已将 \(its.count) 页插入 \(target.lastPathComponent)，原文件已移至废纸篓"
                 if revealAfterSave { NSWorkspace.shared.activateFileViewerSelecting([target]) }
@@ -1089,6 +1280,281 @@ final class AppModel: ObservableObject {
                 alert = "插入失败：\(error.localizedDescription)"
             }
             isSaving = false
+        }
+    }
+
+    // MARK: 导入图片或 PDF
+
+    func chooseImport() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.image, .pdf]
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = false
+        p.prompt = "导入"
+        p.message = "选择要导入的图片或 PDF（可多选）。导入后按当前设置去阴影、裁边、转正。"
+        if p.runModal() == .OK { importFiles(p.urls) }
+    }
+
+    /// 导入的页面和扫描的页面一样进入处理队列；原图先压成 JPEG 保存，避免大文件占用过多内存
+    func importFiles(_ urls: [URL]) {
+        guard !urls.isEmpty, !isImporting, !isSaving else { return }
+        isImporting = true
+        Task {
+            let before = pages.count
+            var failed: [String] = []
+            for u in urls {
+                let name = u.lastPathComponent
+                let type = UTType(filenameExtension: u.pathExtension.lowercased())
+                if type?.conforms(to: .pdf) == true {
+                    guard let doc = PDFDocument(url: u) else { failed.append("\(name)（无法打开）"); continue }
+                    if doc.isLocked { failed.append("\(name)（受密码保护）"); continue }
+                    let n = doc.pageCount
+                    for i in 0..<n {
+                        statusText = "正在导入 \(name)（第 \(i + 1)/\(n) 页）…"
+                        let data = await Task.detached(priority: .userInitiated) { () -> Data? in
+                            guard let d = PDFDocument(url: u), let pg = d.page(at: i) else { return nil }
+                            // 渲染期间必须持有文档，否则页面失去所属文档
+                            return withExtendedLifetime(d) {
+                                ImageOps.renderPDFPage(pg, dpi: 300).map { ImageOps.jpegData($0, quality: 0.92, dpi: 300) }
+                            }
+                        }.value
+                        if let d = data { addPage(d, dpi: 300) } else { failed.append("\(name) 第 \(i + 1) 页") }
+                    }
+                } else if type?.conforms(to: .image) == true {
+                    statusText = "正在导入 \(name)…"
+                    let r = await Task.detached(priority: .userInitiated) { () -> (Data, Int)? in
+                        ImageOps.loadImage(u).map { (ImageOps.jpegData($0.0, quality: 0.92, dpi: $0.1), $0.1) }
+                    }.value
+                    if let (d, dpi) = r { addPage(d, dpi: dpi) } else { failed.append("\(name)（无法读取）") }
+                } else {
+                    failed.append("\(name)（不支持的文件类型）")
+                }
+            }
+            let n = pages.count - before
+            statusText = n > 0 ? "已导入 \(n) 页，共 \(pages.count) 页" : "没有导入任何页面"
+            if !failed.isEmpty { alert = "以下文件未能导入：\n" + failed.joined(separator: "\n") }
+            isImporting = false
+        }
+    }
+
+    // MARK: 空白页
+
+    var blankCount: Int { pages.filter { $0.blank && !$0.processing }.count }
+
+    func requestDeleteBlank() {
+        guard blankCount > 0 else { return }
+        if confirmActions { pendingDeleteBlank = true } else { deleteBlank() }
+    }
+
+    func deleteBlank() {
+        let n = blankCount
+        pages.removeAll { $0.blank && !$0.processing }
+        statusText = "已删除 \(n) 页空白页，共 \(pages.count) 页"
+    }
+
+    // MARK: 文字识别
+
+    /// 程序启动后在后台先识别一次小图，让系统提前准备好文字识别模型
+    func warmUpOCR() {
+        Task {
+            await Task.detached(priority: .utility) {
+                let ctx = CGContext(data: nil, width: 480, height: 120, bitsPerComponent: 8, bytesPerRow: 0, space: ImageOps.srgb,
+                                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+                ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                ctx.fill(CGRect(x: 0, y: 0, width: 480, height: 120))
+                let font = CTFontCreateWithName("HiraginoSansGB-W3" as CFString, 40, nil)
+                ctx.textPosition = CGPoint(x: 20, y: 40)
+                CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: "雷霆扫描 Scan 2026", attributes: [.font: font])), ctx)
+                _ = ImageOps.recognizeText(ctx.makeImage()!)
+            }.value
+            ocrReady = true
+        }
+    }
+
+    /// 识别文字并复制到剪贴板；ids 为空时识别全部页面
+    func copyText(_ ids: [UUID]? = nil) {
+        guard !pages.isEmpty else { return }
+        statusText = ocrReady ? "正在识别文字…" : "正在识别文字（首次使用需要准备约 1 分钟）…"
+        Task {
+            await waitProcessing()
+            let items = pages.filter { ids?.contains($0.id) ?? true }.compactMap { p in p.processed.map { ($0, p.rotation) } }
+            let text = await Task.detached(priority: .userInitiated) {
+                items.map { ImageOps.plainText(ImageOps.recognizeText(ImageOps.rotate($0.0, $0.1))) }
+                    .filter { !$0.isEmpty }.joined(separator: "\n\n")
+            }.value
+            ocrReady = true
+            guard !text.isEmpty else { statusText = "未识别到文字"; return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            statusText = "已复制\(items.count == 1 ? "本页" : " \(items.count) 页")识别到的文字（\(text.count) 字），可直接粘贴"
+        }
+    }
+
+    // MARK: 共享、打印
+
+    func share(password: String? = nil) {
+        guard !pages.isEmpty, !busy else { return }
+        if format == .pdf && encryptPDF && password == nil { passwordRequest = .share; return }
+        isSaving = true
+        statusText = "正在准备共享…"
+        let name = cleanName()
+        Task {
+            await waitProcessing()
+            let its = items(), q = quality.jpeg, fmt = format, ocr = ocrPDF && fmt == .pdf, progress = ocrProgress()
+            let fm = FileManager.default
+            let root = fm.temporaryDirectory.appendingPathComponent("共享", isDirectory: true)
+            try? fm.removeItem(at: root)   // 清掉上一次共享留下的临时文件
+            let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let urls = try await Task.detached(priority: .userInitiated) {
+                    try Exporter.export(its, format: fmt, quality: q, dir: dir, name: name, ocr: ocr, password: password, progress: progress)
+                }.value
+                if ocr { ocrReady = true }
+                isSaving = false
+                statusText = "请选择共享方式"
+                presentSharePicker(urls)
+            } catch {
+                isSaving = false
+                statusText = "共享失败"
+                alert = "共享失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// 在鼠标所在位置弹出系统共享菜单（鼠标不在窗口内时放在窗口右上角）
+    private func presentSharePicker(_ urls: [URL]) {
+        guard let w = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }),
+              let v = w.contentView else { return }
+        var p = v.convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        if !v.bounds.insetBy(dx: 10, dy: 10).contains(p) {
+            p = NSPoint(x: v.bounds.maxX - 160, y: v.isFlipped ? 40 : v.bounds.maxY - 40)
+        }
+        NSSharingServicePicker(items: urls).show(relativeTo: NSRect(x: p.x, y: p.y, width: 1, height: 1), of: v, preferredEdge: .minY)
+    }
+
+    /// 打印：先生成临时 PDF，再打开系统打印设置（扫描后直接打印即为复印）
+    func printPages() {
+        guard !pages.isEmpty, !busy else { return }
+        isSaving = true
+        statusText = "正在准备打印…"
+        let name = cleanName()
+        Task {
+            await waitProcessing()
+            let its = items()
+            let fm = FileManager.default
+            let dir = fm.temporaryDirectory.appendingPathComponent("打印", isDirectory: true)
+            try? fm.removeItem(at: dir)   // 清掉上一次打印留下的临时文件
+            let url = dir.appendingPathComponent("\(name).pdf")
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                try await Task.detached(priority: .userInitiated) { try Exporter.writePDF(its, quality: 0.92, to: url) }.value
+                isSaving = false
+                guard let doc = PDFDocument(url: url),
+                      let info = NSPrintInfo.shared.copy() as? NSPrintInfo,
+                      let op = doc.printOperation(for: info, scalingMode: .pageScaleToFit, autoRotate: true)
+                else { throw AppError("无法生成打印内容。") }
+                printDoc = doc
+                op.jobTitle = name
+                statusText = "已打开打印设置"
+                if let w = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                    op.runModal(for: w, delegate: nil, didRun: nil, contextInfo: nil)
+                } else {
+                    op.run()
+                }
+            } catch {
+                isSaving = false
+                statusText = "打印失败"
+                alert = "打印失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: 密码
+
+    func submitPassword(_ pw: String) {
+        guard let purpose = passwordRequest else { return }
+        passwordRequest = nil
+        switch purpose {
+        case .save(let n): save(name: n, password: pw)
+        case .share: share(password: pw)
+        }
+    }
+
+    func cancelPassword() {
+        passwordRequest = nil
+        statusText = "已取消"
+    }
+
+    // MARK: 证件正反面
+
+    func startIDCard() {
+        guard !busy, idStage == nil else { return }
+        idFront = nil
+        idFrontThumb = nil
+        idStage = .front
+    }
+
+    func cancelIDCard() {
+        idToken += 1
+        idStage = nil
+        idFront = nil
+        idFrontThumb = nil
+    }
+
+    /// 从玻璃板扫描整个区域，裁出证件；扫完正面等待反面，反面扫完后拼到一页
+    func scanIDSide() {
+        guard let stage = idStage, stage == .front || stage == .back, !busy else { return }
+        let isFront = stage == .front
+        let token = idToken
+        isScanning = true
+        idStage = .working(isFront ? "正在扫描正面…" : "正在扫描反面…")
+        Task {
+            defer { isScanning = false }
+            do {
+                if host.trimmingCharacters(in: .whitespaces).isEmpty {
+                    throw AppError("尚未设置扫描仪。请点击左侧「自动查找扫描仪」，或手动输入打印机的 IP 地址。")
+                }
+                let e = esc
+                _ = try await e.status()
+                let full = PaperChoice.full.size
+                let (d, pw, ph) = await e.adjust(feeder: false, dpi: min(600, max(300, dpi)), width: full.0, height: full.1)
+                var got: Data?
+                _ = try await e.scan(feeder: false, gray: color != .color, dpi: d, width: pw, height: ph) { data in got = data }
+                guard token == idToken else { return }
+                guard let data = got, let img = ImageOps.decode(data) else { throw AppError("未获取到扫描结果。") }
+                idStage = .working("正在裁出证件…")
+                let col = color
+                let card = await Task.detached(priority: .userInitiated) { ImageOps.extractCard(img, dpi: d, color: col) }.value
+                guard token == idToken else { return }
+                if card.width > img.width * 9 / 10 && card.height > img.height * 9 / 10 {
+                    throw AppError("没有在玻璃板上找到证件。请把证件平放在玻璃板上，合上盖板后重试。")
+                }
+                if isFront {
+                    idFront = card
+                    idFrontThumb = NSImage(cgImage: ImageOps.scaled(card, maxSide: 400), size: .zero)
+                    idStage = .back
+                    statusText = "证件正面已扫描，请翻面后扫描反面"
+                } else if let front = idFront {
+                    let page = await Task.detached(priority: .userInitiated) { () -> Data in
+                        ImageOps.jpegData(ImageOps.composeCards(front, card, dpi: d), quality: 0.95, dpi: d)
+                    }.value
+                    guard token == idToken else { return }
+                    if let img = ImageOps.decode(page) {
+                        let p = ScanPage(raw: img, dpi: d, oriented: true, locked: true)
+                        pages.append(p)
+                        enqueue(p.id)
+                    }
+                    idStage = nil
+                    idFront = nil
+                    idFrontThumb = nil
+                    statusText = "已将证件正反面合到第 \(pages.count) 页"
+                }
+            } catch {
+                guard token == idToken else { return }
+                idStage = isFront ? .front : .back
+                alert = Self.friendly(error)
+            }
         }
     }
 }
@@ -1244,6 +1710,16 @@ struct ContentView: View {
         .sheet(isPresented: Binding(get: { m.appendTarget != nil }, set: { if !$0 { m.appendTarget = nil } })) {
             InsertSheet().environmentObject(m)
         }
+        .sheet(item: $m.passwordRequest) { purpose in
+            PasswordSheet(purpose: purpose).environmentObject(m)
+        }
+        .sheet(isPresented: Binding(get: { m.idStage != nil }, set: { if !$0 { m.cancelIDCard() } })) {
+            IDCardSheet().environmentObject(m)
+        }
+        .confirmationDialog("确定删除 \(m.blankCount) 页空白页？", isPresented: $m.pendingDeleteBlank) {
+            Button("删除 \(m.blankCount) 页", role: .destructive) { m.deleteBlank() }
+            Button("取消", role: .cancel) {}
+        } message: { Text("这些页面几乎没有内容（只有零星污点或页码）。删除后无法恢复，删除前可以先点开预览确认。") }
         .alert("提示", isPresented: Binding(get: { m.alert != nil }, set: { if !$0 { m.alert = nil } })) {
             Button("确定") { m.alert = nil }
         } message: { Text(m.alert ?? "") }
@@ -1277,9 +1753,25 @@ struct ContentView: View {
                         Text("处理中…").foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button { m.chooseImport() } label: { Label("导入", systemImage: "square.and.arrow.down.on.square") }
+                        .help("导入图片或 PDF（也可以直接拖进窗口）")
+                        .disabled(m.isImporting || m.isSaving)
+                    Button { m.startIDCard() } label: { Label("证件正反面", systemImage: "person.text.rectangle") }
+                        .help("扫描身份证等证件的正反面，合到一页")
+                        .disabled(m.busy)
                     if !m.pages.isEmpty {
-                        Text("点击页面可放大预览").foregroundStyle(.secondary).font(.callout)
-                        Button(role: .destructive) { confirmClear = true } label: { Label("清空全部", systemImage: "trash") }
+                        Button { m.share() } label: { Label("共享", systemImage: "square.and.arrow.up") }
+                            .help("通过邮件、隔空投送等方式发送")
+                            .disabled(m.busy)
+                        Button { m.printPages() } label: { Label("打印", systemImage: "printer") }
+                            .help("打印已扫描的页面（⌘P）")
+                            .disabled(m.busy)
+                        if m.blankCount > 0 {
+                            Button { m.requestDeleteBlank() } label: { Label("删除空白页（\(m.blankCount)）", systemImage: "doc.badge.ellipsis") }
+                                .disabled(m.busy)
+                        }
+                        Button(role: .destructive) { confirmClear = true } label: { Label("清空", systemImage: "trash") }
+                            .help("清空全部已扫描页面")
                             .disabled(m.busy)
                     }
                 }
@@ -1524,7 +2016,7 @@ struct SettingsPanel: View {
                     SettingRow(label: "自动校正方向（依据文字方向）", icon: "rotate.right", last: true) { SettingSwitch(isOn: $m.autoRotate) }
                 }
 
-                SettingsCard(title: "输出") {
+                SettingsCard(title: "输出", footer: "文字识别使用系统自带功能，在本机完成，不上传。密码不会保存，每次保存时输入。") {
                     SettingRow(label: "保存位置", icon: "folder") {
                         Text((m.outputDir as NSString).abbreviatingWithTildeInPath)
                             .foregroundStyle(.secondary)
@@ -1545,6 +2037,14 @@ struct SettingsPanel: View {
                         }
                         .labelsHidden().fixedSize()
                     }
+                    SettingRow(label: "PDF 文字可搜索、可复制", icon: "text.viewfinder") {
+                        SettingSwitch(isOn: $m.ocrPDF).disabled(m.format != .pdf)
+                    }
+                    .help("保存 PDF 时识别页面中的文字，写入不可见的文字层（仅对 PDF 有效）")
+                    SettingRow(label: "保存 PDF 时设置打开密码", icon: "lock") {
+                        SettingSwitch(isOn: $m.encryptPDF).disabled(m.format != .pdf)
+                    }
+                    .help("保存或共享 PDF 前输入密码，打开文件时需要输入该密码（仅对 PDF 有效）")
                     SettingRow(label: "保存后在访达中显示", icon: "eye") { SettingSwitch(isOn: $m.revealAfterSave) }
                     SettingRow(label: "保存后清空已扫描页面", icon: "trash") { SettingSwitch(isOn: $m.clearAfterSave) }
                     SettingRow(label: "删除页面、保存文件前确认", icon: "checkmark.circle", last: true) { SettingSwitch(isOn: $m.confirmActions) }
@@ -1554,30 +2054,92 @@ struct SettingsPanel: View {
 
 struct PagesArea: View {
     @EnvironmentObject var m: AppModel
+    @State private var dropping = false
 
     var body: some View {
-        if m.pages.isEmpty {
-            VStack(spacing: 14) {
-                Image(systemName: "doc.viewfinder")
-                    .font(.system(size: 64, weight: .light))
-                    .foregroundStyle(.secondary)
-                Text("将文件放在平板上或放入自动进纸器，然后点击「扫描」")
-                    .font(.title3)
-                Text("支持连续扫描多页，并合并保存为一个 PDF 文件。\n快捷键：⌘↩ 扫描　⌘S 保存")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 16)], spacing: 16) {
-                    ForEach(Array(m.pages.enumerated()), id: \.element.id) { i, p in
-                        PageCard(page: p, index: i, count: m.pages.count)
-                    }
+        Group {
+            if m.pages.isEmpty {
+                VStack(spacing: 14) {
+                    Image(systemName: "doc.viewfinder")
+                        .font(.system(size: 64, weight: .light))
+                        .foregroundStyle(.secondary)
+                    Text("将文件放在平板上或放入自动进纸器，然后点击「扫描」")
+                        .font(.title3)
+                    Text("支持连续扫描多页，并合并保存为一个 PDF 文件。也可以把图片或 PDF 拖到这里导入。\n快捷键：⌘↩ 扫描　⌘S 保存　⌘O 导入　⌘P 打印")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
                 }
-                .padding(16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 16)], spacing: 16) {
+                        ForEach(Array(m.pages.enumerated()), id: \.element.id) { i, p in
+                            PageCard(page: p, index: i, count: m.pages.count)
+                        }
+                    }
+                    .padding(16)
+                }
             }
         }
+        .modifier(ImportDrop(dropping: $dropping))
+    }
+}
+
+/// 把图片或 PDF 拖进页面区导入；拖动经过时显示虚线框
+struct ImportDrop: ViewModifier {
+    @EnvironmentObject var m: AppModel
+    @Binding var dropping: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if dropping {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.accentColor.opacity(0.08)))
+                        .overlay(Label("松开以导入图片或 PDF", systemImage: "square.and.arrow.down.on.square").font(.title3))
+                        .padding(10)
+                        .allowsHitTesting(false)
+                }
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                m.importFiles(urls)
+                return !urls.isEmpty
+            } isTargeted: { dropping = $0 }
+    }
+}
+
+/// 页面右键菜单（两种布局共用）
+struct PageMenu: View {
+    @EnvironmentObject var m: AppModel
+    let page: ScanPage
+    let index: Int
+    let count: Int
+
+    var body: some View {
+        Button("放大预览") { m.previewID = page.id }
+        Button("复制本页文字") { m.copyText([page.id]) }
+        Divider()
+        Button("向左旋转 90°") { m.rotate(page.id, -90) }
+        Button("向右旋转 90°") { m.rotate(page.id, 90) }
+        Divider()
+        Button("前移") { m.move(page.id, -1) }.disabled(index == 0)
+        Button("后移") { m.move(page.id, 1) }.disabled(index == count - 1)
+        Divider()
+        Button("删除此页", role: .destructive) { m.requestDelete(page.id) }
+    }
+}
+
+/// 空白页标记
+struct BlankBadge: View {
+    var body: some View {
+        Text("可能是空白页")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(Color.orange))
+            .padding(8)
+            .help("这一页几乎没有内容，可在上方一键删除所有空白页")
     }
 }
 
@@ -1616,9 +2178,12 @@ struct PageCard: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
                 }
             }
+            .overlay(alignment: .topLeading) { if page.blank && !page.processing { BlankBadge() } }
             .frame(height: 250)
             .contentShape(Rectangle())
             .onTapGesture { m.previewID = page.id }
+            .help("点击放大预览，右键查看更多操作")
+            .contextMenu { PageMenu(page: page, index: index, count: count) }
             Text("第 \(index + 1) 页").font(.callout)
             HStack(spacing: 4) {
                 IconButton(symbol: "arrow.left", tip: "前移") { m.move(page.id, -1) }.disabled(index == 0)
@@ -1703,11 +2268,32 @@ struct FinderLayout: View {
                 .navigationSplitViewColumnWidth(min: 340, ideal: 360, max: 460)
         } detail: {
             FinderPagesArea()
-                .safeAreaInset(edge: .bottom, spacing: 0) { GlassBottomBar() }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    VStack(spacing: 0) {
+                        if m.blankCount > 0 { BlankNotice() }
+                        GlassBottomBar()
+                    }
+                }
                 .navigationTitle("雷霆扫描")
                 .navigationSubtitle(subtitle)
                 .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
+                    // 访达式分组：获取页面 | 发送页面 | 扫描
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        Button { m.chooseImport() } label: { Label("导入", systemImage: "square.and.arrow.down.on.square") }
+                            .help("导入图片或 PDF（⌘O，也可以直接拖进窗口）")
+                            .disabled(m.isImporting || m.isSaving)
+                        Button { m.startIDCard() } label: { Label("证件正反面", systemImage: "person.text.rectangle") }
+                            .help("扫描身份证等证件的正反面，合到一页（⇧⌘I）")
+                            .disabled(m.busy)
+                    }
+                    ToolbarSpacer(.fixed, placement: .primaryAction)
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        Button { m.share() } label: { Label("共享", systemImage: "square.and.arrow.up") }
+                            .help("通过邮件、隔空投送等方式发送")
+                            .disabled(m.pages.isEmpty || m.busy)
+                        Button { m.printPages() } label: { Label("打印", systemImage: "printer") }
+                            .help("打印已扫描的页面（⌘P）")
+                            .disabled(m.pages.isEmpty || m.busy)
                         Button(role: .destructive) { confirmClear = true } label: {
                             Label("清空全部", systemImage: "trash")
                         }
@@ -1735,30 +2321,42 @@ struct FinderLayout: View {
 @available(macOS 26.0, *)
 struct FinderPagesArea: View {
     @EnvironmentObject var m: AppModel
+    @State private var dropping = false
 
     var body: some View {
-        if m.pages.isEmpty {
-            ContentUnavailableView {
-                Label("放入文件，然后点击「扫描」", systemImage: "doc.viewfinder")
-            } description: {
-                Text("将文件放在平板上或放入自动进纸器。支持连续扫描多页，并合并保存为一个 PDF 文件。\n快捷键：⌘↩ 扫描　⌘S 保存")
-            } actions: {
-                Button { m.scan() } label: { Label("扫描", systemImage: "scanner").padding(.horizontal, 6) }
-                    .buttonStyle(.glassProminent)
-                    .controlSize(.large)
-                    .disabled(m.busy)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 18)], spacing: 22) {
-                    ForEach(Array(m.pages.enumerated()), id: \.element.id) { i, p in
-                        FinderPageItem(page: p, index: i, count: m.pages.count)
+        Group {
+            if m.pages.isEmpty {
+                ContentUnavailableView {
+                    Label("放入文件，然后点击「扫描」", systemImage: "doc.viewfinder")
+                } description: {
+                    Text("将文件放在平板上或放入自动进纸器。支持连续扫描多页，并合并保存为一个 PDF 文件。也可以把图片或 PDF 拖到这里导入。\n快捷键：⌘↩ 扫描　⌘S 保存　⌘O 导入　⌘P 打印")
+                } actions: {
+                    HStack(spacing: 10) {
+                        Button { m.scan() } label: { EvenLabel(title: "扫描", symbol: "scanner") }
+                            .buttonStyle(.glassProminent)
+                            .disabled(m.busy)
+                        Button { m.startIDCard() } label: { EvenLabel(title: "证件正反面", symbol: "person.text.rectangle") }
+                            .buttonStyle(.glass)
+                            .disabled(m.busy)
+                        Button { m.chooseImport() } label: { EvenLabel(title: "导入…", symbol: "square.and.arrow.down.on.square") }
+                            .buttonStyle(.glass)
+                            .disabled(m.isImporting || m.isSaving)
                     }
+                    .controlSize(.large)
                 }
-                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 18)], spacing: 22) {
+                        ForEach(Array(m.pages.enumerated()), id: \.element.id) { i, p in
+                            FinderPageItem(page: p, index: i, count: m.pages.count)
+                        }
+                    }
+                    .padding(20)
+                }
             }
         }
+        .modifier(ImportDrop(dropping: $dropping))
     }
 }
 
@@ -1791,12 +2389,13 @@ struct FinderPageItem: View {
                 }
             }
             .frame(height: 236)
+            .overlay(alignment: .topLeading) { if page.blank && !page.processing { BlankBadge() } }
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(Color.primary.opacity(hover ? 0.07 : 0)))
             .contentShape(Rectangle())
             .onTapGesture { m.previewID = page.id }
-            .help("点击放大预览")
+            .help("点击放大预览，右键查看更多操作")
             Text("第 \(index + 1) 页").font(.callout.weight(.medium))
             HStack(spacing: 2) {
                 IconButton(symbol: "arrow.left", tip: "前移") { m.move(page.id, -1) }.disabled(index == 0)
@@ -1808,17 +2407,43 @@ struct FinderPageItem: View {
             .foregroundStyle(.secondary)
         }
         .onHover { hover = $0 }
-        .contextMenu {
-            Button("放大预览") { m.previewID = page.id }
-            Divider()
-            Button("向左旋转 90°") { m.rotate(page.id, -90) }
-            Button("向右旋转 90°") { m.rotate(page.id, 90) }
-            Divider()
-            Button("前移") { m.move(page.id, -1) }.disabled(index == 0)
-            Button("后移") { m.move(page.id, 1) }.disabled(index == count - 1)
-            Divider()
-            Button("删除此页", role: .destructive) { m.requestDelete(page.id) }
+        .contextMenu { PageMenu(page: page, index: index, count: count) }
+    }
+}
+
+/// 并排按钮用的标签：图标放进同样大小的框里，按钮高度不再随图标高矮变化
+struct EvenLabel: View {
+    let title: String
+    let symbol: String
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: symbol)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 19, height: 17)
+            Text(title)
         }
+        .frame(height: 22)
+        .padding(.horizontal, 4)
+    }
+}
+
+/// 发现空白页时，浮在底栏上方的提示条
+@available(macOS 26.0, *)
+struct BlankNotice: View {
+    @EnvironmentObject var m: AppModel
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "doc.badge.ellipsis").foregroundStyle(.orange)
+            Text("有 \(m.blankCount) 页可能是空白页")
+            Button("全部删除") { m.requestDeleteBlank() }
+                .buttonStyle(.glassProminent)
+                .tint(.orange)
+                .disabled(m.busy)
+        }
+        .padding(.leading, 16).padding(.trailing, 6).padding(.vertical, 6)
+        .glassEffect(.regular, in: .capsule)
+        .padding(.top, 8)
     }
 }
 
@@ -1830,7 +2455,7 @@ struct GlassBottomBar: View {
     var body: some View {
         HStack(spacing: 10) {
             HStack(spacing: 8) {
-                if m.busy { ProgressView().controlSize(.small) }
+                if m.busy || m.isImporting { ProgressView().controlSize(.small) }
                 Text(m.statusText)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -1942,6 +2567,111 @@ struct PreviewSheet: View {
     }
 }
 
+/// 设置 PDF 打开密码（输入两次）
+struct PasswordSheet: View {
+    @EnvironmentObject var m: AppModel
+    let purpose: AppModel.ExportPurpose
+    @State private var pw = ""
+    @State private var pw2 = ""
+
+    var problem: String? {
+        if pw.isEmpty { return nil }
+        if pw.count < 4 { return "密码至少 4 位。" }
+        if !pw2.isEmpty && pw != pw2 { return "两次输入的密码不一致。" }
+        return nil
+    }
+    var ok: Bool { pw.count >= 4 && pw == pw2 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("设置 PDF 打开密码").font(.title3.bold())
+            Text(purposeText).font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Form {
+                SecureField("密码", text: $pw)
+                SecureField("再次输入", text: $pw2)
+            }
+            .formStyle(.columns)
+            Text(problem ?? "请牢记密码：忘记后无法打开文件，本软件也不会保存密码。")
+                .font(.callout)
+                .foregroundStyle(problem == nil ? Color.secondary : Color.red)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("取消") { m.cancelPassword() }.keyboardShortcut(.cancelAction)
+                Button(confirmText) { m.submitPassword(pw) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!ok)
+            }
+        }
+        .padding(22)
+        .frame(width: 420)
+    }
+
+    var purposeText: String {
+        if case .share = purpose { return "共享出去的 PDF 需要输入此密码才能打开。" }
+        return "保存的 PDF 需要输入此密码才能打开。"
+    }
+    var confirmText: String { if case .share = purpose { return "共享" }; return "保存" }
+}
+
+/// 证件正反面：分两步扫描，自动裁出证件并拼到一页
+struct IDCardSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var working: String? { if case .working(let s) = m.idStage { return s }; return nil }
+    var backStep: Bool { m.idStage == .back || (working != nil && m.idFrontThumb != nil) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("证件正反面").font(.title3.bold())
+            Text("适用于身份证、驾驶证、银行卡等卡片。分别扫描正反面，自动裁出卡片并摆正，按实际大小上下排在同一页 A4 上。")
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .top, spacing: 14) {
+                step(1, "扫描正面", "证件正面朝下放在玻璃板上，位置不限，合上盖板。", done: m.idFrontThumb != nil, active: !backStep)
+                step(2, "扫描反面", "把证件翻过来，反面朝下放好，合上盖板。", done: false, active: backStep)
+            }
+            if let t = m.idFrontThumb {
+                HStack(spacing: 10) {
+                    Image(nsImage: t).resizable().aspectRatio(contentMode: .fit).frame(height: 70)
+                        .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+                    Text("正面已扫描").foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                if let w = working {
+                    ProgressView().controlSize(.small)
+                    Text(w).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("取消") { m.cancelIDCard() }.keyboardShortcut(.cancelAction)
+                Button(backStep ? "扫描反面" : "扫描正面") { m.scanIDSide() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(working != nil)
+            }
+        }
+        .padding(22)
+        .frame(width: 480)
+    }
+
+    func step(_ n: Int, _ title: String, _ detail: String, done: Bool, active: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: done ? "checkmark.circle.fill" : "\(n).circle\(active ? ".fill" : "")")
+                .font(.title2)
+                .foregroundStyle(done ? Color.green : (active ? Color.accentColor : Color.secondary))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(active || done ? 1 : 0.55)
+    }
+}
+
 struct InsertSheet: View {
     @EnvironmentObject var m: AppModel
 
@@ -1992,6 +2722,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        // 调试：SCAN_TEST_IMPORT=文件1,文件2 按「导入」的方式载入图片或 PDF
+        if let list = env["SCAN_TEST_IMPORT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                AppModel.shared?.importFiles(list.split(separator: ",").map { URL(fileURLWithPath: String($0)) })
+            }
+        }
         if let out = env["SCAN_SNAPSHOT"] {
             let delay = Double(env["SCAN_SNAPSHOT_DELAY"] ?? "6") ?? 6
             var oldFrame: NSRect?
@@ -2006,10 +2742,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     w.center()
                 }
                 w.makeFirstResponder(nil)
-                // SCAN_TEST_ACTION=save / delete：截图前触发保存确认或删除确认，用于检查确认框
+            }
+            // SCAN_TEST_ACTION=save / delete / blank / password / idcard / print / share：截图前触发对应的对话框或操作；
+            // 默认在截图前 2 秒触发，SCAN_TEST_ACTION_AT=秒 可提前（导出较慢的操作需要留出时间）
+            let actionAt = Double(env["SCAN_TEST_ACTION_AT"] ?? "") ?? max(1, delay - 2)
+            DispatchQueue.main.asyncAfter(deadline: .now() + actionAt) {
                 switch env["SCAN_TEST_ACTION"] {
                 case "save": AppModel.shared?.requestSave()
                 case "delete": if let id = AppModel.shared?.pages.first?.id { AppModel.shared?.requestDelete(id) }
+                case "blank": AppModel.shared?.requestDeleteBlank()
+                case "password": AppModel.shared?.passwordRequest = .save("测试")
+                case "idcard": AppModel.shared?.startIDCard()
+                case "print": AppModel.shared?.printPages()
+                case "share": AppModel.shared?.share()
                 default: break
                 }
             }
@@ -2052,7 +2797,20 @@ struct ScanApp: App {
                 .onAppear { model.startPolling() }
         }
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button("导入图片或 PDF…") { model.chooseImport() }.keyboardShortcut("o")
+                Button("扫描证件正反面…") { model.startIDCard() }.keyboardShortcut("i", modifiers: [.command, .shift])
+            }
+            CommandGroup(after: .saveItem) {
+                Button("共享…") { model.share() }
+            }
+            CommandGroup(replacing: .printItem) {
+                Button("打印…") { model.printPages() }.keyboardShortcut("p")
+            }
+            CommandGroup(after: .pasteboard) {
+                Divider()
+                Button("复制全部页面的文字") { model.copyText() }.keyboardShortcut("c", modifiers: [.command, .option])
+            }
         }
     }
 }
@@ -2114,8 +2872,52 @@ enum CLI {
             let rot = o["rot"] == "auto" ? ImageOps.detectRotation(out) : (Int(o["rot"] ?? "0") ?? 0)
             print(String(format: "处理 %dx%d -> %dx%d 旋转 %d° 用时 %.2fs", src.width, src.height, out.width, out.height, rot, Date().timeIntervalSince(t)))
             do {
-                try Exporter.writePDF([.init(image: out, dpi: dpi, rotation: rot)], quality: 0.8, to: outURL)
+                let t2 = Date()
+                try Exporter.writePDF([.init(image: out, dpi: dpi, rotation: rot)], quality: 0.8,
+                                      ocr: o["ocr"] == "1", password: o["password"], to: outURL)
+                if o["ocr"] == "1" { print(String(format: "识别文字并写入 %.2fs", Date().timeIntervalSince(t2))) }
             } catch { print(error.localizedDescription); return 1 }
+            return 0
+        case "--blank":
+            // --blank 图1 图2 …：打印每张图的墨迹比例和空白判断
+            for f in pos.dropFirst() {
+                guard let d = try? Data(contentsOf: URL(fileURLWithPath: f)), let img = ImageOps.decode(d) else { print(f, "无法读取"); continue }
+                let s = settings(o)
+                let p = ImageOps.process(img, dpi: Int(o["dpi"] ?? "300") ?? 300, s: s)
+                let r = ImageOps.inkRatio(p)
+                print(String(format: "%@  墨迹 %.5f  %@", (f as NSString).lastPathComponent, r, r < 0.0003 ? "空白" : "有内容"))
+            }
+            return 0
+        case "--text":
+            // --text 图片：打印识别出的文字
+            guard pos.count >= 2, let d = try? Data(contentsOf: URL(fileURLWithPath: pos[1])), let img = ImageOps.decode(d) else { print("无法读取输入文件"); return 1 }
+            print(ImageOps.plainText(ImageOps.recognizeText(img)))
+            return 0
+        case "--idcard":
+            // --idcard 正面整版扫描.jpg 反面整版扫描.jpg 输出.pdf [dpi=300] [color=…]
+            guard pos.count >= 4 else { print("用法：--idcard 正面.jpg 反面.jpg 输出.pdf"); return 2 }
+            let dpi = Int(o["dpi"] ?? "300") ?? 300
+            let color: ColorChoice = o["color"] == "gray" ? .gray : (o["color"] == "bw" ? .bw : .color)
+            let imgs = pos[1...2].compactMap { (try? Data(contentsOf: URL(fileURLWithPath: $0))).flatMap(ImageOps.decode) }
+            guard imgs.count == 2 else { print("无法读取输入文件"); return 1 }
+            let f = ImageOps.extractCard(imgs[0], dpi: dpi, color: color), b = ImageOps.extractCard(imgs[1], dpi: dpi, color: color)
+            print("正面 \(f.width)x\(f.height)  反面 \(b.width)x\(b.height)")
+            do { try Exporter.writePDF([.init(image: ImageOps.composeCards(f, b, dpi: dpi), dpi: dpi, rotation: 0)], quality: 0.9, to: URL(fileURLWithPath: pos[3])) }
+            catch { print(error.localizedDescription); return 1 }
+            return 0
+        case "--load":
+            // --load 图片或PDF 输出.pdf：按导入的方式读取（摆正、估算分辨率、渲染 PDF 各页）
+            guard pos.count >= 3 else { print("用法：--load 输入 输出.pdf"); return 2 }
+            let inURL = URL(fileURLWithPath: pos[1])
+            var items: [Exporter.Item] = []
+            if inURL.pathExtension.lowercased() == "pdf" {
+                guard let doc = PDFDocument(url: inURL) else { print("无法打开 PDF"); return 1 }
+                for i in 0..<doc.pageCount { if let pg = doc.page(at: i), let img = ImageOps.renderPDFPage(pg, dpi: 300) { items.append(.init(image: img, dpi: 300, rotation: 0)) } }
+            } else if let (img, dpi) = ImageOps.loadImage(inURL) {
+                items.append(.init(image: img, dpi: dpi, rotation: 0))
+            }
+            for (i, it) in items.enumerated() { print("第 \(i + 1) 页 \(it.image.width)x\(it.image.height) @\(it.dpi)dpi") }
+            do { try Exporter.writePDF(items, quality: 0.8, to: URL(fileURLWithPath: pos[2])) } catch { print(error.localizedDescription); return 1 }
             return 0
         case "--scan":
             guard pos.count >= 2 else { print("用法：--scan 输出.pdf [选项]"); return 2 }

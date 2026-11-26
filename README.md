@@ -1,6 +1,6 @@
 # 雷霆扫描
 
-macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint 扫描）** 协议的联网多功能一体机，支持连续扫描多页，并可自动去除阴影、裁除空白、校正方向，最终保存为 PDF 或 JPG。
+macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint 扫描）** 协议的联网多功能一体机，支持连续扫描多页，并可自动去除阴影、裁除空白、校正方向，最终保存为 PDF（可搜索文字、可加密码）或 JPG，也可以直接共享或打印。
 
 本软件不依赖打印机厂商驱动，也不依赖 Bonjour 服务发现：在启用代理软件（如 ClashX）导致系统无法发现打印机的情况下，仍可通过网段探测找到扫描仪。
 
@@ -22,8 +22,15 @@ macOS 网络扫描工具。通过局域网直接连接支持 **eSCL（AirPrint �
 - **自动裁除四周空白**：适用于护照、证件、票据
 - **去除污点和灰尘**：去除孤立的小污点，阈值随分辨率换算
 - **自动校正方向**：使用系统文字识别（Vision）判断文字方向，自动校正倒置或横置的页面
-- **多页管理**：每页可旋转、调整顺序、删除及放大预览
+- **多页管理**：每页可旋转、调整顺序、删除及放大预览；右键可复制本页文字
+- **证件正反面**：分两次扫描身份证、驾驶证、银行卡等卡片，自动裁出卡片并按文字方向摆正，按实际大小上下排在同一页 A4 上
+- **导入图片或 PDF**：点「导入」或直接拖进窗口；手机照片按拍摄方向摆正，PDF 逐页渲染，之后与扫描页面一样去阴影、裁边、转正
+- **空白页检测**：按墨迹比例标出可能的空白页（零星污点、只有页码），可一键删除
 - **输出**：保存为多页 PDF（JPEG 压缩，三档质量）或每页一张 JPG，可指定保存位置
+  - 可搜索 PDF：用系统文字识别（Vision，简体中文与英文，在本机完成）写入不可见文字层，可搜索、可选中复制
+  - 打开密码：保存或共享 PDF 前输入密码（不保存密码）
+  - 复制文字：识别全部或单页文字并复制到剪贴板
+- **共享与打印**：通过系统共享菜单发送（邮件、隔空投送等）；直接打印扫描页面，相当于复印
 - **插入到现有 PDF**：将扫描页面插入现有 PDF 文件的指定位置，原文件先移至废纸篓备份
 - **自动查找扫描仪**：在本机所在网段中探测 eSCL 设备
 - **操作确认**：删除页面、保存文件前弹出确认（可在设置中关闭）；保存确认会列出页数、文件名与保存位置
@@ -67,7 +74,11 @@ macOS 27 的命令行工具缺少 SwiftUI 宏插件（`SwiftUIMacros`），使�
 ```bash
 Scanner --discover                                   # 查找局域网中的扫描仪
 Scanner --scan out.pdf [host=IP] [dpi=300] [bg=document|light|off] [color=color|gray|bw] [crop=1] [rot=auto]
-Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
+Scanner --process in.pdf|in.jpg out.pdf [同上处理选项] [ocr=1] [password=密码]
+Scanner --load in.pdf|in.jpg out.pdf                 # 按「导入」的方式读取（摆正照片、渲染 PDF 各页）
+Scanner --idcard 正面.jpg 反面.jpg out.pdf [dpi=300]  # 从两张整版扫描图中裁出证件并拼到一页
+Scanner --text in.jpg                                # 打印识别出的文字
+Scanner --blank 图1 图2 … [bg=…]                     # 打印每张图的墨迹比例和空白判断
 ```
 
 `Scanner` 位于 `雷霆扫描.app/Contents/MacOS/` 目录下。
@@ -78,8 +89,9 @@ Scanner --process in.pdf|in.jpg out.pdf [同上处理选项]
 | --- | --- |
 | `SCAN_DEMO=1` | 演示模式：显示示例地址，不连接真实设备 |
 | `SCAN_TEST_IMAGES=图1,图2` | 启动后预先载入页面 |
+| `SCAN_TEST_IMPORT=文件1,文件2` | 启动后按「导入」的方式载入图片或 PDF |
 | `SCAN_SNAPSHOT=输出.png` | 启动后截取窗口并退出；可配合 `SCAN_SNAPSHOT_SIZE=宽x高`、`SCAN_SNAPSHOT_DELAY=秒` |
-| `SCAN_TEST_ACTION=save` / `delete` | 截图前触发保存确认或删除确认，确认框另存为 `*_sheet.png` |
+| `SCAN_TEST_ACTION=save` / `delete` / `blank` / `password` / `idcard` / `print` / `share` | 截图前触发对应的确认框、对话框或操作，弹出的对话框另存为 `*_sheet.png`；默认在截图前 2 秒触发，`SCAN_TEST_ACTION_AT=秒` 可提前 |
 | `SCAN_APPEARANCE=light` / `dark` | 强制浅色或暗色外观 |
 | `SCAN_STYLE=glass` / `plain` | 强制使用毛玻璃（macOS 26 及以上为访达式界面）或中性配色 |
 
