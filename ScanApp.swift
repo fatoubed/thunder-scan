@@ -2708,13 +2708,28 @@ struct InsertSheet: View {
 // MARK: - App 入口
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var appearanceObservation: NSKeyValueObservation?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Dock 图标跟随深浅色：深色模式用黑夜版（AppIcon-dark.png），浅色用白天版
+    private func updateDockIcon() {
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if let url = Bundle.main.url(forResource: dark ? "AppIcon-dark" : "AppIcon-light", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = image
+        }
+    }
 
     // 调试用：SCAN_TEST_IMAGES=图1,图2 预先放入页面；SCAN_SNAPSHOT=输出.png 几秒后把窗口截图并退出
     func applicationDidFinishLaunching(_ notification: Notification) {
         let env = ProcessInfo.processInfo.environment
         // 调试：SCAN_APPEARANCE=dark / light 强制外观
         if let a = env["SCAN_APPEARANCE"] { NSApp.appearance = NSAppearance(named: a == "dark" ? .darkAqua : .aqua) }
+        updateDockIcon()
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.updateDockIcon() }
+        }
         if let list = env["SCAN_TEST_IMAGES"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 for path in list.split(separator: ",") {

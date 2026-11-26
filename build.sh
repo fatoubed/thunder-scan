@@ -54,6 +54,8 @@ if [ ! -f AppIcon.icns ]; then
   iconutil -c icns build/AppIcon.iconset -o AppIcon.icns
 fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# 运行时 Dock 图标跟随深浅色（由 make_icon_v2.py 生成）
+for f in AppIcon-light.png AppIcon-dark.png; do [ -f "$f" ] && cp "$f" "$APP/Contents/Resources/$f"; done
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
